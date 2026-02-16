@@ -1,0 +1,56 @@
+# rsyslog sample configuration for Docker container
+# Minimal config that accepts syslog on UDP/TCP and logs to files and stdout
+
+# Load modules
+module(load="imuxsock")   # Unix socket input
+module(load="imudp")      # UDP input
+module(load="imtcp")      # TCP input
+
+# Input from UDP (port 514)
+input(type="imudp" port="514")
+
+# Input from TCP (port 514)
+input(type="imtcp" port="514")
+
+# Unix socket for local logging
+input(type="imuxsock" socket="/dev/log")
+
+# Set default permissions for all log files
+$FileOwner syslog
+$FileGroup adm
+$FileCreateMode 0640
+$DirCreateMode 0755
+$Umask 0022
+
+# Define templates for log output
+$template RFC3164fmt,"%HOSTNAME% %syslogtag%%msg:::sp-if-no-1st-sp%%msg:::drop-last-lf%\n"
+$template RFC5424fmt,"%TIMESTAMP:::date-rfc3339% %HOSTNAME% %syslogtag% %msg%\n"
+$template DynFile,"/var/log/rsyslog/%HOSTNAME%/syslog"
+
+# Messages from the kernel
+kern.*                                                  /var/log/kern.log
+
+# All mail messages in one place
+mail.*                                                  /var/log/mail
+mail.err                                                /var/log/mail.err
+
+# News messages
+uucp,news.crit                                          /var/log/news/news.crit
+uucp,news.err                                           /var/log/news/news.err
+
+# Emergency messages
+*.emerg                                                 :omusrmsg:*
+
+# Log everything to a catch-all file
+*.* /var/log/syslog
+
+# Log to stdout for container visibility (comment out if not needed)
+# *.* :omstdout:
+
+# Send emergency messages to root
+*.emerg                                                 :omusrmsg:root
+
+# For debugging
+# Turn on debug logging to see detailed info
+# $DebugFile /var/log/rsyslog-debug.log
+# $DebugLevel 2
