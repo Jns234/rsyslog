@@ -1228,5 +1228,8 @@ EXTRA_DIST = \
     tools/buildenv/tools/help \
     tools/buildenv/tools/version-info \
     tools/fix-mermaid-offline.py \
+    tools/inside_docker_doc_html.sh \
+    tools/pages-root-index.html \
+    tools/pages-robots.txt \
     tools/release_build.sh \
     utils/release_build.sh
