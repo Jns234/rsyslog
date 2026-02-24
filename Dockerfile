@@ -21,7 +21,7 @@ RUN ./autogen.sh && ./configure --prefix=/usr --enable-omazuredce && make -j$(np
 
 # runtime image: keep it Ubuntu for library compatibility
 FROM ubuntu:24.04 AS runtime
-RUN apt-get update && apt-get install -y ca-certificates libsystemd0 libssl3 libyaml-0-2 libestr0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates libsystemd0 libssl3 libyaml-0-2 libestr0 libcurl3t64-gnutls && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r syslog && useradd -r -g syslog syslog
 RUN mkdir -p /var/log && chown -R syslog:syslog /var/log
 COPY --from=build /out/usr/sbin/rsyslogd /usr/sbin/rsyslogd
@@ -29,4 +29,4 @@ COPY --from=build /out/usr/lib/rsyslog /usr/lib/rsyslog
 COPY --from=build /usr/lib/x86_64-linux-gnu/libfastjson.so* /usr/lib/x86_64-linux-gnu/
 COPY rsyslog.conf.sample /etc/rsyslog.conf
 #EXPOSE 514/udp 514/tcp
-CMD ["/usr/sbin/rsyslogd","-dn"]
+CMD ["/usr/sbin/rsyslogd","-n"]
