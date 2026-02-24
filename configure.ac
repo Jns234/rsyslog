@@ -2868,6 +2868,18 @@ fi
 AM_CONDITIONAL(ENABLE_OMKAFKA, test x$enable_omkafka = xyes -o x$enable_omkafka = xoptional)
 AM_CONDITIONAL(ENABLE_IMKAFKA, test x$enable_imkafka = xyes -o x$enable_imkafka = xoptional)
 
+# omazuredce support for output module
+AC_ARG_ENABLE(omazuredce,
+        [AS_HELP_STRING([--enable-omazuredce],[Compiles omazuredce output module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omazuredce="yes" ;;
+          no) enable_omazuredce="no" ;;
+         optional) enable_omazuredce="optional" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omazuredce) ;;
+         esac],
+        [enable_omazuredce=no]
+)
+AM_CONDITIONAL(ENABLE_OMAZUREDCE, test x$enable_omazuredce = xyes)
 
 # omazureeventhubs support for output module
 AC_ARG_ENABLE(omazureeventhubs,
@@ -3453,6 +3465,7 @@ AC_CONFIG_FILES([Makefile \
 		plugins/pmlastmsg/Makefile \
 		plugins/mmdblookup/Makefile \
 		plugins/omazureeventhubs/Makefile \
+		plugins/omazuredce/Makefile \
 		plugins/imdtls/Makefile \
 		plugins/omdtls/Makefile \
 		contrib/mmdarwin/Makefile \
@@ -3570,6 +3583,7 @@ echo "    omtcl module will be compiled:            $enable_omtcl"
 echo "    omkafka module will be compiled:          $enable_omkafka"
 echo "    omhiredis module will be compiled:        $enable_omhiredis"
 echo "    omazureeventhubs module will be compiled: $enable_omazureeventhubs"
+echo "    omazuredce module will be compiled:       $enable_omazuredce"
 echo "    omdtls module will be compiled:           $enable_omdtls"
 echo
 echo "---{ parser modules }---"

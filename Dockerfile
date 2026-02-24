@@ -14,9 +14,10 @@ RUN mkdir -p /helper-projects && cd /helper-projects && \
 	./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu --includedir=/usr/include && \
 	make -j$(nproc) && make install && rm -rf /helper-projects/libfastjson
 
+	
 WORKDIR /src
 COPY . /src
-RUN ./autogen.sh && ./configure --prefix=/usr && make -j$(nproc) && make install DESTDIR=/out
+RUN ./autogen.sh && ./configure --prefix=/usr --enable-omazuredce && make -j$(nproc) && make install DESTDIR=/out
 
 # runtime image: keep it Ubuntu for library compatibility
 FROM ubuntu:24.04 AS runtime
@@ -27,5 +28,5 @@ COPY --from=build /out/usr/sbin/rsyslogd /usr/sbin/rsyslogd
 COPY --from=build /out/usr/lib/rsyslog /usr/lib/rsyslog
 COPY --from=build /usr/lib/x86_64-linux-gnu/libfastjson.so* /usr/lib/x86_64-linux-gnu/
 COPY rsyslog.conf.sample /etc/rsyslog.conf
-EXPOSE 514/udp 514/tcp
-CMD ["/usr/sbin/rsyslogd","-n"]
+#EXPOSE 514/udp 514/tcp
+CMD ["/usr/sbin/rsyslogd","-dn"]
