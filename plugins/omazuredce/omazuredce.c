@@ -51,6 +51,7 @@ MODULE_CNFNAME("omazuredce")
     https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/service-limits#logs-ingestion-api */
 #define AZURE_MAX_FIELD_BYTES (64 * 1024)
 #define AZURE_OAUTH_SCOPE "https://monitor.azure.com/.default"
+#define AZUREDCE_TimeGenerated "\"%timegenerated:::date-rfc3339%\""
 
 /* Since I will be requesting a access token for log forwarding, this will come in useful https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#first-case-access-token-request-with-a-shared-secret*/
 
@@ -67,6 +68,7 @@ typedef struct _instanceData {
 	uchar *accessToken;
 	int maxBatchBytes;
 	int flushTimeoutMs;
+	sbool includeTimeGenerated;
 } instanceData;
 
 typedef struct wrkrInstanceData {
@@ -90,7 +92,8 @@ static struct cnfparamdescr actpdescr[] = {
 	{"dcr_id", eCmdHdlrString, 0},
 	{"table_name", eCmdHdlrString, 0},
 	{"max_batch_bytes", eCmdHdlrInt, 0},
-	{"flush_timeout_ms", eCmdHdlrNonNegInt, 0}
+	{"flush_timeout_ms", eCmdHdlrNonNegInt, 0},
+	{"time_generated", eCmdHdlrBinary, 0}
 };
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
@@ -425,7 +428,7 @@ static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
 	payloadLen = pWrkrData->batchLen;
 	pWrkrData->batchBuf[payloadLen] = '\0';
 
-	n = snprintf(meta, sizeof(meta),
+	/*n = snprintf(meta, sizeof(meta),
 		     "omazuredce prototype config: client_id='%s' client_secret='%s' tenant_id='%s' "
 		     "dce_url='%s' dcr_id='%s' table_name='%s' max_batch_bytes=%d flush_timeout_ms=%d access_token='",
 		     safeStr(pData->clientID), safeStr(pData->clientSecret), safeStr(pData->tenantID),
@@ -437,6 +440,7 @@ static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
 	}
 	CHKiRet(writeAll(safeStr(pData->accessToken), strlen(safeStr(pData->accessToken))));
 	CHKiRet(writeAll("'\n", 2));
+	*/
 
 	n = snprintf(meta, sizeof(meta), "omazuredce prototype batch: records=%zu bytes=%zu payload=", pWrkrData->recordCount,
 		     payloadLen);
@@ -475,15 +479,21 @@ finalize_it:
 	RETiRet;
 }
 
-static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const char *msg) {
+static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const char *msg, const char *timeGenerated) {
 	static const char recStart[] = "{\"message\":\"";
+	static const char timeGeneratedField[] = "\",\"TimeGenerated\":\"";
 	static const char recEnd[] = "\"}";
 	const size_t escapedLen = jsonEscapedLen(msg);
-	const size_t recLen =
-		(pWrkrData->recordCount > 0 ? 1 : 0) + sizeof(recStart) - 1 + escapedLen + sizeof(recEnd) - 1;
+	size_t recLen = (pWrkrData->recordCount > 0 ? 1 : 0) + sizeof(recStart) - 1 + escapedLen + sizeof(recEnd) - 1;
+	size_t timeGeneratedLen = 0;
 	DEFiRet;
 	DBGPRINTF("omazuredce[%p]: add message escapedLen=%zu projectedRecordLen=%zu currentBatchLen=%zu\n", pWrkrData,
 		  escapedLen, recLen, pWrkrData->batchLen);
+
+	if (pWrkrData->pData->includeTimeGenerated && timeGenerated != NULL && timeGenerated[0] != '\0') {
+		timeGeneratedLen = jsonEscapedLen(timeGenerated);
+		recLen += sizeof(timeGeneratedField) - 1 + timeGeneratedLen;
+	}
 
 	if (pWrkrData->batchLen + recLen + 1 > (size_t)pWrkrData->pData->maxBatchBytes) {
 		DBGPRINTF("omazuredce[%p]: batch limit reached, forcing flush before append\n", pWrkrData);
@@ -500,6 +510,10 @@ static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const c
 	if (pWrkrData->recordCount > 0) CHKiRet(appendChar(pWrkrData, ','));
 	CHKiRet(appendRaw(pWrkrData, recStart, sizeof(recStart) - 1));
 	CHKiRet(appendEscapedJSON(pWrkrData, msg));
+	if (pWrkrData->pData->includeTimeGenerated && timeGenerated != NULL && timeGenerated[0] != '\0') {
+		CHKiRet(appendRaw(pWrkrData, timeGeneratedField, sizeof(timeGeneratedField) - 1));
+		CHKiRet(appendEscapedJSON(pWrkrData, timeGenerated));
+	}
 	CHKiRet(appendRaw(pWrkrData, recEnd, sizeof(recEnd) - 1));
 	pWrkrData->recordCount++;
 	DBGPRINTF("omazuredce[%p]: message appended, recordCount=%zu batchLen=%zu\n", pWrkrData, pWrkrData->recordCount,
@@ -550,6 +564,7 @@ static inline void setInstParamDefaults(instanceData *pData) {
 	pData->accessToken = NULL;
 	pData->maxBatchBytes = AZURE_MAX_BATCH_BYTES;
 	pData->flushTimeoutMs = 1000;
+	pData->includeTimeGenerated = 0;
 }
 
 BEGINbeginCnfLoad
@@ -659,6 +674,7 @@ BEGINdbgPrintInstInfo
 	dbgprintf("\ttable_name='%s'\n", safeStr(pData->tableName));
 	dbgprintf("\tmax_batch_bytes='%d'\n", pData->maxBatchBytes);
 	dbgprintf("\tflush_timeout_ms='%d'\n", pData->flushTimeoutMs);
+	dbgprintf("\ttime_generated='%d'\n", pData->includeTimeGenerated);
 	dbgprintf("\taccess_token=%s\n", pData->accessToken == NULL ? "<unset>" : "<set>");
 ENDdbgPrintInstInfo
 
@@ -674,10 +690,13 @@ ENDbeginTransaction
 
 BEGINdoAction
 	const char *msg;
+	const char *timeGenerated;
 	size_t msgLen;
 	int lockHeld = 0;
+	size_t recCnt;
 	CODESTARTdoAction;
-	msg = (const char *)ppString[0];
+	msg = (ppString != NULL) ? (const char *)ppString[0] : "";
+	timeGenerated = (pWrkrData->pData->includeTimeGenerated && ppString != NULL) ? (const char *)ppString[1] : NULL;
 	if (msg == NULL) msg = "";
 	msgLen = strlen(msg);
 	DBGPRINTF("omazuredce[%p]: doAction msgLen=%zu preview='%.*s%s'\n", pWrkrData, msgLen,
@@ -687,14 +706,16 @@ BEGINdoAction
 		ABORT_FINALIZE(RS_RET_SYS_ERR);
 	}
 	lockHeld = 1;
-	CHKiRet(addMessageToBatchUnlocked(pWrkrData, msg));
+	CHKiRet(addMessageToBatchUnlocked(pWrkrData, msg, timeGenerated));
+	recCnt = pWrkrData->recordCount;
 	pWrkrData->lastMessageTimeMs = nowMs();
 	if (pthread_mutex_unlock(&pWrkrData->batchLock) != 0) {
 		lockHeld = 0;
 		ABORT_FINALIZE(RS_RET_SYS_ERR);
 	}
 	lockHeld = 0;
-	iRet = RS_RET_DEFER_COMMIT;
+	/* Signal queue engine that all previous records are already batched/flushed. */
+	iRet = (recCnt == 1) ? RS_RET_PREVIOUS_COMMITTED : RS_RET_DEFER_COMMIT;
 finalize_it:
 	if (lockHeld) {
 		(void)pthread_mutex_unlock(&pWrkrData->batchLock);
@@ -705,6 +726,7 @@ ENDdoAction
 BEGINendTransaction
 	CODESTARTendTransaction;
 	DBGPRINTF("omazuredce[%p]: endTransaction\n", pWrkrData);
+	/* Preserve time-based batching: only force flush when timeout is explicitly disabled. */
 	if (pWrkrData->pData->flushTimeoutMs == 0) {
 		CHKiRet(flushBatch(pWrkrData));
 	}
@@ -715,6 +737,7 @@ ENDendTransaction
 BEGINnewActInst
 	struct cnfparamvals *pvals;
 	int i;
+	int nTpls;
 	uchar *tplToUse;
 	CODESTARTnewActInst;
 	DBGPRINTF("omazuredce: newActInst begin\n");
@@ -727,7 +750,6 @@ BEGINnewActInst
 
 	CHKiRet(createInstance(&pData));
 	setInstParamDefaults(pData);
-	CODE_STD_STRING_REQUESTnewActInst(1);
 
 	for (i = 0; i < actpblk.nParams; ++i) {
 		if (!pvals[i].bUsed) continue;
@@ -751,12 +773,15 @@ BEGINnewActInst
 			pData->maxBatchBytes = (int)pvals[i].val.d.n;
 		} else if (!strcmp(actpblk.descr[i].name, "flush_timeout_ms")) {
 			pData->flushTimeoutMs = (int)pvals[i].val.d.n;
+		} else if (!strcmp(actpblk.descr[i].name, "time_generated")) {
+			pData->includeTimeGenerated = (sbool)pvals[i].val.d.n;
 		}
 	}
 	DBGPRINTF("omazuredce: parsed params template='%s' client_id='%s' tenant_id='%s' dce_url='%s' dcr_id='%s' "
-		  "table_name='%s' max_batch_bytes=%d flush_timeout_ms=%d client_secret=%s\n",
+		  "table_name='%s' max_batch_bytes=%d flush_timeout_ms=%d time_generated=%d client_secret=%s\n",
 		  safeStr(pData->templateName), safeStr(pData->clientID), safeStr(pData->tenantID), safeStr(pData->dceURL),
 		  safeStr(pData->dcrID), safeStr(pData->tableName), pData->maxBatchBytes, pData->flushTimeoutMs,
+		  pData->includeTimeGenerated,
 		  (pData->clientSecret == NULL) ? "<unset>" : "<set>");
 
 	if (pData->maxBatchBytes <= 0 || pData->maxBatchBytes > AZURE_MAX_BATCH_BYTES) {
@@ -766,8 +791,13 @@ BEGINnewActInst
 		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
 	}
 
+	nTpls = pData->includeTimeGenerated ? 2 : 1;
+	CODE_STD_STRING_REQUESTnewActInst(nTpls);
 	tplToUse = (uchar *)strdup((pData->templateName == NULL) ? "RSYSLOG_FileFormat" : (char *)pData->templateName);
 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS));
+	if (pData->includeTimeGenerated) {
+		CHKiRet(OMSRsetEntry(*ppOMSR, 1, (uchar *)strdup(" AZUREDCE_TimeGenerated"), OMSR_NO_RQD_TPL_OPTS));
+	}
 
 	CODE_STD_FINALIZERnewActInst;
 	cnfparamvalsDestruct(pvals, &actpblk);
@@ -784,12 +814,14 @@ NO_LEGACY_CONF_parseSelectorAct;
 BEGINqueryEtryPt
 	CODESTARTqueryEtryPt;
 	CODEqueryEtryPt_STD_OMOD_QUERIES;
+	CODEqueryEtryPt_TXIF_OMOD_QUERIES;
 	CODEqueryEtryPt_STD_OMOD8_QUERIES;
 	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES;
 	CODEqueryEtryPt_STD_CONF2_QUERIES;
 ENDqueryEtryPt
 
 BEGINmodInit()
+	uchar *pTmp;
 	CODESTARTmodInit;
 	*ipIFVersProvided = CURR_MOD_IF_VERSION;
 	CODEmodInit_QueryRegCFSLineHdlr
@@ -797,6 +829,8 @@ BEGINmodInit()
 		LogError(0, RS_RET_OBJ_CREATION_FAILED, "omazuredce: curl_global_init failed");
 		ABORT_FINALIZE(RS_RET_OBJ_CREATION_FAILED);
 	}
+	pTmp = (uchar *)AZUREDCE_TimeGenerated;
+	tplAddLine(ourConf, " AZUREDCE_TimeGenerated", &pTmp);
 	DBGPRINTF("omazuredce: modInit complete\n");
 ENDmodInit
 

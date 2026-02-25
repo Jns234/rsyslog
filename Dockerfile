@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y \
 	gcc g++ make pkg-config libssl-dev zlib1g-dev liblz4-dev libzstd-dev libcurl4-gnutls-dev \
 	libgnutls28-dev libsystemd-dev libestr-dev uuid-dev libgcrypt20-dev librelp-dev libyaml-dev && rm -rf /var/lib/apt/lists/*
 
-ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 
 # build helper libs (libfastjson) which may not be packaged
 RUN mkdir -p /helper-projects && cd /helper-projects && \
