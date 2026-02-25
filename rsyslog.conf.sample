@@ -11,9 +11,6 @@ module(load="omazuredce") # load the new output module (omazuredce)
 # Input from UDP (port 514)
 input(type="imudp" port="514")
 
-# Input from TCP (port 514)
-input(type="imtcp" port="514")
-
 # Unix socket for local logging
 input(type="imuxsock" socket="/dev/log")
 
@@ -32,25 +29,30 @@ template(name="RFC5424fmt" type="string"
 template(name="DynFile" type="string"
          string="/var/log/rsyslog/%HOSTNAME%/syslog")
 
+# Ruleset used only by TCP/514 input
+ruleset(name="tcp514_to_azure") {
+  # Forward only TCP/514 logs to Azure Log Ingestion API
+  action(
+    type="omazuredce"
+    template="RFC3164fmt"
+    queue.type="LinkedList"
+    queue.size="10000"
+    queue.dequeuebatchsize="1000"
+    queue.workerthreads="1"
+    client_id=""
+    client_secret=""
+    tenant_id=""
+    dce_url=""
+    dcr_id=""
+    table_name="Custom-Ingested_CL"
+    time_generated="on"
+    max_batch_bytes="1048576"
+    flush_timeout_ms="2000"
+  )
+}
 
-# Forward logs to Azure Log Ingestion API (prototype module prints config + payload)
-*.*       action(
-             type="omazuredce"
-             template="RFC3164fmt"
-             queue.type="LinkedList"
-             queue.size="10000"
-             queue.dequeuebatchsize="1000"
-             queue.workerthreads="1"
-             client_id=""
-             client_secret=""
-             tenant_id=""
-             dce_url="https://your-dce-name.region.ingest.monitor.azure.com"
-             dcr_id="dcr-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-             table_name="CustomLogs_CL"
-             time_generated="on"
-             max_batch_bytes="1048576"
-             flush_timeout_ms="2000"
-           )
+# Input from TCP (port 514) - bound to Azure ruleset
+input(type="imtcp" port="514" ruleset="tcp514_to_azure")
 
 # Send emergency messages to root as well
 *.emerg   action(type="omusrmsg" users="root")

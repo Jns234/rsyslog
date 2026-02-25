@@ -1,8 +1,8 @@
 /* omazuredce.c
  * Prototype output module for Azure Monitor Logs Ingestion API (DCE/DCR).
  *
- * This prototype does not perform HTTP requests yet. It batches messages into
- * JSON under 1 MiB and prints both configuration and payload to stdout.
+ * This module batches messages into JSON under 1 MiB and posts each batch to
+ * the Azure Monitor Logs Ingestion API endpoint.
  *
  * Copyright 2026 Adiscon GmbH.
  *
@@ -28,7 +28,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <sys/time.h>
 #include <ctype.h>
@@ -294,20 +293,104 @@ static uint64_t nowMs(void) {
 	return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
 }
 
-static rsRetVal writeAll(const char *buf, size_t len) {
+static rsRetVal postBatchToAzure(instanceData *pData, wrkrInstanceData_t *pWrkrData, size_t payloadLen) {
+	const char *urlSuffixFmt = "dataCollectionRules/%s/streams/%s?api-version=2023-01-01";
+	const char *slash = "";
+	char *url = NULL;
+	char *authHeader = NULL;
+	char *dce = NULL;
+	size_t urlLen;
+	CURL *curl = NULL;
+	CURLcode curlRes;
+	long httpCode = 0;
+	tokenRespBuf_t response = {NULL, 0};
+	struct curl_slist *headers = NULL;
+	int attempt;
 	DEFiRet;
-	size_t off = 0;
 
-	while (off < len) {
-		const ssize_t wr = write(1, buf + off, len - off);
-		if (wr <= 0) {
-			DBGPRINTF("omazuredce: writeAll failed while writing %zu bytes (offset=%zu)\n", len, off);
+	if (pData->dceURL == NULL || pData->dcrID == NULL || pData->tableName == NULL) {
+		LogError(0, RS_RET_PARAM_ERROR,
+			 "omazuredce: cannot post batch, missing one of dce_url/dcr_id/table_name");
+		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+	}
+
+	if (pData->accessToken == NULL || pData->accessToken[0] == '\0') {
+		CHKiRet(requestAccessToken(pData));
+	}
+
+	dce = (char *)pData->dceURL;
+	if (dce[0] != '\0' && dce[strlen(dce) - 1] == '/') {
+		slash = "";
+	} else {
+		slash = "/";
+	}
+	urlLen = strlen(dce) + strlen(slash) + strlen("/dataCollectionRules/") + strlen((char *)pData->dcrID) +
+		 strlen("/streams/") + strlen((char *)pData->tableName) + strlen("?api-version=2023-01-01") + 1;
+	CHKmalloc(url = malloc(urlLen));
+	snprintf(url, urlLen, "%s%s", dce, slash);
+	snprintf(url + strlen(url), urlLen - strlen(url), urlSuffixFmt, (char *)pData->dcrID, (char *)pData->tableName);
+
+	for (attempt = 0; attempt < 2; ++attempt) {
+		curl = curl_easy_init();
+		if (curl == NULL) {
+			LogError(0, RS_RET_ERR, "omazuredce: curl_easy_init failed while posting batch");
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+
+		CHKmalloc(authHeader = malloc(strlen("Authorization: Bearer ") + strlen((char *)pData->accessToken) + 1));
+		snprintf(authHeader, strlen("Authorization: Bearer ") + strlen((char *)pData->accessToken) + 1,
+			 "Authorization: Bearer %s", (char *)pData->accessToken);
+
+		headers = curl_slist_append(headers, "Content-Type: application/json");
+		headers = curl_slist_append(headers, authHeader);
+		curl_easy_setopt(curl, CURLOPT_URL, url);
+		curl_easy_setopt(curl, CURLOPT_POST, 1L);
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, pWrkrData->batchBuf);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)payloadLen);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, tokenWriteCb);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+
+		DBGPRINTF("omazuredce: posting batch url='%s' bytes=%zu attempt=%d\n", url, payloadLen, attempt + 1);
+		curlRes = curl_easy_perform(curl);
+		if (curlRes != CURLE_OK) {
+			LogError(0, RS_RET_IO_ERROR, "omazuredce: batch post failed: %s", curl_easy_strerror(curlRes));
 			ABORT_FINALIZE(RS_RET_IO_ERROR);
 		}
-		off += (size_t)wr;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+		if (httpCode >= 200 && httpCode < 300) {
+			DBGPRINTF("omazuredce: batch post successful status=%ld response='%s'\n", httpCode,
+				  response.data == NULL ? "" : response.data);
+			LogMsg(0, RS_RET_OK, LOG_INFO, "omazuredce: posted batch records=%ld stream=%s",
+			       pWrkrData->recordCount, safeStr(pData->tableName));
+			FINALIZE;
+		}
+		if (httpCode == 401 && attempt == 0) {
+			DBGPRINTF("omazuredce: batch post got 401, refreshing access token and retrying\n");
+			CHKiRet(requestAccessToken(pData));
+			free(response.data);
+			response.data = NULL;
+			response.len = 0;
+			curl_slist_free_all(headers);
+			headers = NULL;
+			curl_easy_cleanup(curl);
+			curl = NULL;
+			free(authHeader);
+			authHeader = NULL;
+			continue;
+		}
+		LogError(0, RS_RET_IO_ERROR, "omazuredce: batch post HTTP status=%ld response='%s'", httpCode,
+			 response.data == NULL ? "" : response.data);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
 	}
 
 finalize_it:
+	free(url);
+	free(authHeader);
+	free(response.data);
+	if (headers != NULL) curl_slist_free_all(headers);
+	if (curl != NULL) curl_easy_cleanup(curl);
 	RETiRet;
 }
 
@@ -411,11 +494,8 @@ static void resetBatch(wrkrInstanceData_t *pWrkrData) {
 }
 
 static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
-	char meta[768];
 	instanceData *const pData = pWrkrData->pData;
 	size_t payloadLen;
-	int n;
-	size_t outLen;
 	DEFiRet;
 	DBGPRINTF("omazuredce[%p]: flushBatch enter, records=%zu currentLen=%zu\n", pWrkrData, pWrkrData->recordCount,
 		  pWrkrData->batchLen);
@@ -427,29 +507,9 @@ static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
 	CHKiRet(appendChar(pWrkrData, ']'));
 	payloadLen = pWrkrData->batchLen;
 	pWrkrData->batchBuf[payloadLen] = '\0';
-
-	/*n = snprintf(meta, sizeof(meta),
-		     "omazuredce prototype config: client_id='%s' client_secret='%s' tenant_id='%s' "
-		     "dce_url='%s' dcr_id='%s' table_name='%s' max_batch_bytes=%d flush_timeout_ms=%d access_token='",
-		     safeStr(pData->clientID), safeStr(pData->clientSecret), safeStr(pData->tenantID),
-		     safeStr(pData->dceURL), safeStr(pData->dcrID), safeStr(pData->tableName), pData->maxBatchBytes,
-		     pData->flushTimeoutMs);
-	if (n > 0) {
-		outLen = ((size_t)n < sizeof(meta)) ? (size_t)n : sizeof(meta) - 1;
-		CHKiRet(writeAll(meta, outLen));
-	}
-	CHKiRet(writeAll(safeStr(pData->accessToken), strlen(safeStr(pData->accessToken))));
-	CHKiRet(writeAll("'\n", 2));
-	*/
-
-	n = snprintf(meta, sizeof(meta), "omazuredce prototype batch: records=%zu bytes=%zu payload=", pWrkrData->recordCount,
-		     payloadLen);
-	if (n > 0) {
-		outLen = ((size_t)n < sizeof(meta)) ? (size_t)n : sizeof(meta) - 1;
-		CHKiRet(writeAll(meta, outLen));
-	}
-	CHKiRet(writeAll(pWrkrData->batchBuf, payloadLen));
-	CHKiRet(writeAll("\n", 1));
+	DBGPRINTF("omazuredce[%p]: flush batch posting records=%zu payloadBytes=%zu payload='%s'\n", pWrkrData,
+		  pWrkrData->recordCount, payloadLen, pWrkrData->batchBuf);
+	CHKiRet(postBatchToAzure(pData, pWrkrData, payloadLen));
 	DBGPRINTF("omazuredce[%p]: flushed batch records=%zu payloadBytes=%zu\n", pWrkrData, pWrkrData->recordCount,
 		  payloadLen);
 
@@ -484,8 +544,10 @@ static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const c
 	static const char timeGeneratedField[] = "\",\"TimeGenerated\":\"";
 	static const char recEnd[] = "\"}";
 	const size_t escapedLen = jsonEscapedLen(msg);
+	const size_t maxBatchBytes = (size_t)pWrkrData->pData->maxBatchBytes;
 	size_t recLen = (pWrkrData->recordCount > 0 ? 1 : 0) + sizeof(recStart) - 1 + escapedLen + sizeof(recEnd) - 1;
 	size_t timeGeneratedLen = 0;
+	size_t projectedLen;
 	DEFiRet;
 	DBGPRINTF("omazuredce[%p]: add message escapedLen=%zu projectedRecordLen=%zu currentBatchLen=%zu\n", pWrkrData,
 		  escapedLen, recLen, pWrkrData->batchLen);
@@ -495,12 +557,15 @@ static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const c
 		recLen += sizeof(timeGeneratedField) - 1 + timeGeneratedLen;
 	}
 
-	if (pWrkrData->batchLen + recLen + 1 > (size_t)pWrkrData->pData->maxBatchBytes) {
+	/* +1 reserves room for the trailing ']' when the batch is flushed */
+	projectedLen = pWrkrData->batchLen + recLen + 1;
+	if (projectedLen > maxBatchBytes && pWrkrData->recordCount > 0) {
 		DBGPRINTF("omazuredce[%p]: batch limit reached, forcing flush before append\n", pWrkrData);
 		CHKiRet(flushBatchUnlocked(pWrkrData));
+		projectedLen = pWrkrData->batchLen + recLen + 1;
 	}
 
-	if (pWrkrData->batchLen + recLen + 1 > (size_t)pWrkrData->pData->maxBatchBytes) {
+	if (projectedLen > maxBatchBytes) {
 		LogError(0, RS_RET_ERR,
 			 "omazuredce: dropping over-sized log record, escaped_len=%zu max_batch_bytes=%d",
 			 escapedLen, pWrkrData->pData->maxBatchBytes);
