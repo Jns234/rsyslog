@@ -28,13 +28,20 @@ template(name="RFC5424fmt" type="string"
          string="%TIMESTAMP:::date-rfc3339% %HOSTNAME% %syslogtag% %msg%\n")
 template(name="DynFile" type="string"
          string="/var/log/rsyslog/%HOSTNAME%/syslog")
+template(name="HostUserMessageJSON" type="string"
+         string="{\"TimeGenerated\":\"%$!parsed!timegenerated:::json%\",\"host\":\"%$!parsed!host:::json%\",\"ident\":\"%$!parsed!ident:::json%\",\"message\":\"%$!parsed!message:::json%\"}")
 
 # Ruleset used only by TCP/514 input
 ruleset(name="tcp514_to_azure") {
+    set $!parsed!timegenerated = $timereported;
+    set $!parsed!host = $hostname;
+    set $!parsed!ident = $app-name;
+    set $!parsed!message = $msg;
+
   # Forward only TCP/514 logs to Azure Log Ingestion API
   action(
     type="omazuredce"
-    template="RFC3164fmt"
+    template="HostUserMessageJSON"
     queue.type="LinkedList"
     queue.size="10000"
     queue.dequeuebatchsize="1000"
@@ -44,8 +51,7 @@ ruleset(name="tcp514_to_azure") {
     tenant_id=""
     dce_url=""
     dcr_id=""
-    table_name="Custom-Ingested_CL"
-    time_generated="on"
+    table_name=""
     max_batch_bytes="1048576"
     flush_timeout_ms="2000"
   )
@@ -59,5 +65,5 @@ input(type="imtcp" port="514" ruleset="tcp514_to_azure")
 
 # For debugging
 # Turn on debug logging to see detailed info
-# $DebugFile /var/log/rsyslog-debug.log
-# $DebugLevel 2
+#$DebugFile /var/log/rsyslog-debug.log
+#$DebugLevel 2

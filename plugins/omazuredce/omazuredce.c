@@ -30,7 +30,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/time.h>
-#include <ctype.h>
+#include <json.h>
 #include <curl/curl.h>
 #include "conf.h"
 #include "syslogd-types.h"
@@ -50,7 +50,6 @@ MODULE_CNFNAME("omazuredce")
     https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/service-limits#logs-ingestion-api */
 #define AZURE_MAX_FIELD_BYTES (64 * 1024)
 #define AZURE_OAUTH_SCOPE "https://monitor.azure.com/.default"
-#define AZUREDCE_TimeGenerated "\"%timegenerated:::date-rfc3339%\""
 
 /* Since I will be requesting a access token for log forwarding, this will come in useful https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#first-case-access-token-request-with-a-shared-secret*/
 
@@ -67,7 +66,6 @@ typedef struct _instanceData {
 	uchar *accessToken;
 	int maxBatchBytes;
 	int flushTimeoutMs;
-	sbool includeTimeGenerated;
 } instanceData;
 
 typedef struct wrkrInstanceData {
@@ -91,8 +89,7 @@ static struct cnfparamdescr actpdescr[] = {
 	{"dcr_id", eCmdHdlrString, 0},
 	{"table_name", eCmdHdlrString, 0},
 	{"max_batch_bytes", eCmdHdlrInt, 0},
-	{"flush_timeout_ms", eCmdHdlrNonNegInt, 0},
-	{"time_generated", eCmdHdlrBinary, 0}
+	{"flush_timeout_ms", eCmdHdlrNonNegInt, 0}
 };
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
@@ -124,74 +121,6 @@ static size_t tokenWriteCb(void *contents, size_t size, size_t nmemb, void *user
 	return realsz;
 }
 
-static char *extractJsonStringField(const char *json, const char *field) {
-	char needle[128];
-	char *p;
-	char *start;
-	char *out;
-	size_t outLen = 0;
-
-	if (json == NULL || field == NULL) return NULL;
-
-	if (snprintf(needle, sizeof(needle), "\"%s\"", field) <= 0) return NULL;
-	p = strstr((char *)json, needle);
-	if (p == NULL) return NULL;
-	p += strlen(needle);
-
-	while (*p != '\0' && *p != ':') ++p;
-	if (*p != ':') return NULL;
-	++p;
-
-	while (*p != '\0' && isspace((unsigned char)*p)) ++p;
-	if (*p != '"') return NULL;
-	++p;
-	start = p;
-
-	out = malloc(strlen(start) + 1);
-	if (out == NULL) return NULL;
-
-	while (*p != '\0') {
-		if (*p == '\\') {
-			++p;
-			if (*p == '\0') break;
-			switch (*p) {
-			case '"':
-			case '\\':
-			case '/':
-				out[outLen++] = *p;
-				break;
-			case 'b':
-				out[outLen++] = '\b';
-				break;
-			case 'f':
-				out[outLen++] = '\f';
-				break;
-			case 'n':
-				out[outLen++] = '\n';
-				break;
-			case 'r':
-				out[outLen++] = '\r';
-				break;
-			case 't':
-				out[outLen++] = '\t';
-				break;
-			default:
-				out[outLen++] = *p;
-				break;
-			}
-		} else if (*p == '"') {
-			out[outLen] = '\0';
-			return out;
-		} else {
-			out[outLen++] = *p;
-		}
-		++p;
-	}
-
-	free(out);
-	return NULL;
-}
-
 static rsRetVal requestAccessToken(instanceData *pData) {
 	char tokenURL[512];
 	char *body = NULL;
@@ -205,6 +134,9 @@ static rsRetVal requestAccessToken(instanceData *pData) {
 	struct curl_slist *headers = NULL;
 	tokenRespBuf_t response = {NULL, 0};
 	char *token = NULL;
+	struct json_object *tokenResp = NULL;
+	struct json_object *tokenField = NULL;
+	const char *tokenStr = NULL;
 	DEFiRet;
 
 	if (pData->clientID == NULL || pData->clientSecret == NULL || pData->tenantID == NULL) {
@@ -264,11 +196,18 @@ static rsRetVal requestAccessToken(instanceData *pData) {
 		ABORT_FINALIZE(RS_RET_IO_ERROR);
 	}
 
-	token = extractJsonStringField(response.data, "access_token");
-	if (token == NULL || token[0] == '\0') {
+	tokenResp = json_tokener_parse(response.data == NULL ? "" : response.data);
+	if (tokenResp == NULL || !json_object_object_get_ex(tokenResp, "access_token", &tokenField) ||
+	    !json_object_is_type(tokenField, json_type_string)) {
 		LogError(0, RS_RET_IO_ERROR, "omazuredce: access_token not found in token response");
 		ABORT_FINALIZE(RS_RET_IO_ERROR);
 	}
+	tokenStr = json_object_get_string(tokenField);
+	if (tokenStr == NULL || tokenStr[0] == '\0') {
+		LogError(0, RS_RET_IO_ERROR, "omazuredce: access_token is empty in token response");
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+	CHKmalloc(token = strdup(tokenStr));
 
 	free(pData->accessToken);
 	pData->accessToken = (uchar *)token;
@@ -284,6 +223,7 @@ finalize_it:
 	if (escScope != NULL) curl_free(escScope);
 	if (headers != NULL) curl_slist_free_all(headers);
 	if (curl != NULL) curl_easy_cleanup(curl);
+	if (tokenResp != NULL) json_object_put(tokenResp);
 	RETiRet;
 }
 
@@ -394,28 +334,6 @@ finalize_it:
 	RETiRet;
 }
 
-static size_t jsonEscapedLen(const char *s) {
-	size_t n = 0;
-	for (; *s != '\0'; ++s) {
-		const unsigned char c = (unsigned char)*s;
-		switch (c) {
-		case '"':
-		case '\\':
-		case '\b':
-		case '\f':
-		case '\n':
-		case '\r':
-		case '\t':
-			n += 2;
-			break;
-		default:
-			n += (c < 0x20) ? 6 : 1;
-			break;
-		}
-	}
-	return n;
-}
-
 static rsRetVal appendChar(wrkrInstanceData_t *pWrkrData, const char c) {
 	DEFiRet;
 	if (pWrkrData->batchLen + 1 > (size_t)pWrkrData->pData->maxBatchBytes) {
@@ -437,52 +355,67 @@ finalize_it:
 	RETiRet;
 }
 
-static rsRetVal appendEscapedJSON(wrkrInstanceData_t *pWrkrData, const char *s) {
-	static const char hex[] = "0123456789abcdef";
+static rsRetVal mergeJsonObjectText(struct json_object *recordObj, const char *jsonText, const char *srcName) {
+	struct json_object *parsedObj = NULL;
+	struct json_object_iterator iter;
+	struct json_object_iterator iterEnd;
 	DEFiRet;
 
-	for (; *s != '\0'; ++s) {
-		const unsigned char c = (unsigned char)*s;
-		switch (c) {
-		case '"':
-			CHKiRet(appendRaw(pWrkrData, "\\\"", 2));
-			break;
-		case '\\':
-			CHKiRet(appendRaw(pWrkrData, "\\\\", 2));
-			break;
-		case '\b':
-			CHKiRet(appendRaw(pWrkrData, "\\b", 2));
-			break;
-		case '\f':
-			CHKiRet(appendRaw(pWrkrData, "\\f", 2));
-			break;
-		case '\n':
-			CHKiRet(appendRaw(pWrkrData, "\\n", 2));
-			break;
-		case '\r':
-			CHKiRet(appendRaw(pWrkrData, "\\r", 2));
-			break;
-		case '\t':
-			CHKiRet(appendRaw(pWrkrData, "\\t", 2));
-			break;
-		default:
-			if (c < 0x20) {
-				char esc[6];
-				esc[0] = '\\';
-				esc[1] = 'u';
-				esc[2] = '0';
-				esc[3] = '0';
-				esc[4] = hex[(c >> 4) & 0x0f];
-				esc[5] = hex[c & 0x0f];
-				CHKiRet(appendRaw(pWrkrData, esc, sizeof(esc)));
-			} else {
-				CHKiRet(appendChar(pWrkrData, (char)c));
-			}
-			break;
+	if (jsonText == NULL || jsonText[0] == '\0') {
+		FINALIZE;
+	}
+
+	parsedObj = json_tokener_parse(jsonText);
+	if (parsedObj == NULL || !json_object_is_type(parsedObj, json_type_object)) {
+		LogError(0, RS_RET_ERR, "omazuredce: %s template must render JSON object, got: '%s'", srcName, jsonText);
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	iter = json_object_iter_begin(parsedObj);
+	iterEnd = json_object_iter_end(parsedObj);
+	while (!json_object_iter_equal(&iter, &iterEnd)) {
+		const char *key = json_object_iter_peek_name(&iter);
+		struct json_object *value = json_object_iter_peek_value(&iter);
+		if (key != NULL && value != NULL) {
+			json_object_object_add(recordObj, key, json_object_get(value));
 		}
+		json_object_iter_next(&iter);
 	}
 
 finalize_it:
+	if (parsedObj != NULL) json_object_put(parsedObj);
+	RETiRet;
+}
+
+static rsRetVal buildRecordJson(const char *msg, char **recordJson, size_t *recordLen) {
+	struct json_object *recordObj = NULL;
+	const char *jsonText;
+	DEFiRet;
+
+	*recordJson = NULL;
+	*recordLen = 0;
+	if (msg == NULL) msg = "";
+
+	if ((recordObj = json_object_new_object()) == NULL) {
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+
+	CHKiRet(mergeJsonObjectText(recordObj, msg, "message"));
+
+	jsonText = json_object_to_json_string_ext(recordObj, JSON_C_TO_STRING_PLAIN);
+	if (jsonText == NULL) {
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+	CHKmalloc(*recordJson = strdup(jsonText));
+	*recordLen = strlen(*recordJson);
+
+finalize_it:
+	if (recordObj != NULL) json_object_put(recordObj);
+	if (iRet != RS_RET_OK) {
+		free(*recordJson);
+		*recordJson = NULL;
+		*recordLen = 0;
+	}
 	RETiRet;
 }
 
@@ -540,22 +473,17 @@ finalize_it:
 }
 
 static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const char *msg, const char *timeGenerated) {
-	static const char recStart[] = "{\"message\":\"";
-	static const char timeGeneratedField[] = "\",\"TimeGenerated\":\"";
-	static const char recEnd[] = "\"}";
-	const size_t escapedLen = jsonEscapedLen(msg);
+	char *recordJson = NULL;
+	size_t recordLen = 0;
 	const size_t maxBatchBytes = (size_t)pWrkrData->pData->maxBatchBytes;
-	size_t recLen = (pWrkrData->recordCount > 0 ? 1 : 0) + sizeof(recStart) - 1 + escapedLen + sizeof(recEnd) - 1;
-	size_t timeGeneratedLen = 0;
+	size_t recLen;
 	size_t projectedLen;
 	DEFiRet;
-	DBGPRINTF("omazuredce[%p]: add message escapedLen=%zu projectedRecordLen=%zu currentBatchLen=%zu\n", pWrkrData,
-		  escapedLen, recLen, pWrkrData->batchLen);
-
-	if (pWrkrData->pData->includeTimeGenerated && timeGenerated != NULL && timeGenerated[0] != '\0') {
-		timeGeneratedLen = jsonEscapedLen(timeGenerated);
-		recLen += sizeof(timeGeneratedField) - 1 + timeGeneratedLen;
-	}
+	(void)timeGenerated;
+	CHKiRet(buildRecordJson(msg, &recordJson, &recordLen));
+	recLen = (pWrkrData->recordCount > 0 ? 1 : 0) + recordLen;
+	DBGPRINTF("omazuredce[%p]: add message recordLen=%zu currentBatchLen=%zu\n", pWrkrData, recLen,
+		  pWrkrData->batchLen);
 
 	/* +1 reserves room for the trailing ']' when the batch is flushed */
 	projectedLen = pWrkrData->batchLen + recLen + 1;
@@ -567,24 +495,19 @@ static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const c
 
 	if (projectedLen > maxBatchBytes) {
 		LogError(0, RS_RET_ERR,
-			 "omazuredce: dropping over-sized log record, escaped_len=%zu max_batch_bytes=%d",
-			 escapedLen, pWrkrData->pData->maxBatchBytes);
+			 "omazuredce: dropping over-sized log record, record_len=%zu max_batch_bytes=%d", recordLen,
+			 pWrkrData->pData->maxBatchBytes);
 		ABORT_FINALIZE(RS_RET_OK);
 	}
 
 	if (pWrkrData->recordCount > 0) CHKiRet(appendChar(pWrkrData, ','));
-	CHKiRet(appendRaw(pWrkrData, recStart, sizeof(recStart) - 1));
-	CHKiRet(appendEscapedJSON(pWrkrData, msg));
-	if (pWrkrData->pData->includeTimeGenerated && timeGenerated != NULL && timeGenerated[0] != '\0') {
-		CHKiRet(appendRaw(pWrkrData, timeGeneratedField, sizeof(timeGeneratedField) - 1));
-		CHKiRet(appendEscapedJSON(pWrkrData, timeGenerated));
-	}
-	CHKiRet(appendRaw(pWrkrData, recEnd, sizeof(recEnd) - 1));
+	CHKiRet(appendRaw(pWrkrData, recordJson, recordLen));
 	pWrkrData->recordCount++;
 	DBGPRINTF("omazuredce[%p]: message appended, recordCount=%zu batchLen=%zu\n", pWrkrData, pWrkrData->recordCount,
 		  pWrkrData->batchLen);
 
 finalize_it:
+	free(recordJson);
 	RETiRet;
 }
 
@@ -629,7 +552,6 @@ static inline void setInstParamDefaults(instanceData *pData) {
 	pData->accessToken = NULL;
 	pData->maxBatchBytes = AZURE_MAX_BATCH_BYTES;
 	pData->flushTimeoutMs = 1000;
-	pData->includeTimeGenerated = 0;
 }
 
 BEGINbeginCnfLoad
@@ -739,7 +661,6 @@ BEGINdbgPrintInstInfo
 	dbgprintf("\ttable_name='%s'\n", safeStr(pData->tableName));
 	dbgprintf("\tmax_batch_bytes='%d'\n", pData->maxBatchBytes);
 	dbgprintf("\tflush_timeout_ms='%d'\n", pData->flushTimeoutMs);
-	dbgprintf("\ttime_generated='%d'\n", pData->includeTimeGenerated);
 	dbgprintf("\taccess_token=%s\n", pData->accessToken == NULL ? "<unset>" : "<set>");
 ENDdbgPrintInstInfo
 
@@ -755,13 +676,11 @@ ENDbeginTransaction
 
 BEGINdoAction
 	const char *msg;
-	const char *timeGenerated;
 	size_t msgLen;
 	int lockHeld = 0;
 	size_t recCnt;
 	CODESTARTdoAction;
 	msg = (ppString != NULL) ? (const char *)ppString[0] : "";
-	timeGenerated = (pWrkrData->pData->includeTimeGenerated && ppString != NULL) ? (const char *)ppString[1] : NULL;
 	if (msg == NULL) msg = "";
 	msgLen = strlen(msg);
 	DBGPRINTF("omazuredce[%p]: doAction msgLen=%zu preview='%.*s%s'\n", pWrkrData, msgLen,
@@ -771,7 +690,7 @@ BEGINdoAction
 		ABORT_FINALIZE(RS_RET_SYS_ERR);
 	}
 	lockHeld = 1;
-	CHKiRet(addMessageToBatchUnlocked(pWrkrData, msg, timeGenerated));
+	CHKiRet(addMessageToBatchUnlocked(pWrkrData, msg, NULL));
 	recCnt = pWrkrData->recordCount;
 	pWrkrData->lastMessageTimeMs = nowMs();
 	if (pthread_mutex_unlock(&pWrkrData->batchLock) != 0) {
@@ -838,15 +757,12 @@ BEGINnewActInst
 			pData->maxBatchBytes = (int)pvals[i].val.d.n;
 		} else if (!strcmp(actpblk.descr[i].name, "flush_timeout_ms")) {
 			pData->flushTimeoutMs = (int)pvals[i].val.d.n;
-		} else if (!strcmp(actpblk.descr[i].name, "time_generated")) {
-			pData->includeTimeGenerated = (sbool)pvals[i].val.d.n;
 		}
 	}
 	DBGPRINTF("omazuredce: parsed params template='%s' client_id='%s' tenant_id='%s' dce_url='%s' dcr_id='%s' "
-		  "table_name='%s' max_batch_bytes=%d flush_timeout_ms=%d time_generated=%d client_secret=%s\n",
+		  "table_name='%s' max_batch_bytes=%d flush_timeout_ms=%d client_secret=%s\n",
 		  safeStr(pData->templateName), safeStr(pData->clientID), safeStr(pData->tenantID), safeStr(pData->dceURL),
 		  safeStr(pData->dcrID), safeStr(pData->tableName), pData->maxBatchBytes, pData->flushTimeoutMs,
-		  pData->includeTimeGenerated,
 		  (pData->clientSecret == NULL) ? "<unset>" : "<set>");
 
 	if (pData->maxBatchBytes <= 0 || pData->maxBatchBytes > AZURE_MAX_BATCH_BYTES) {
@@ -856,13 +772,10 @@ BEGINnewActInst
 		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
 	}
 
-	nTpls = pData->includeTimeGenerated ? 2 : 1;
+	nTpls = 1;
 	CODE_STD_STRING_REQUESTnewActInst(nTpls);
 	tplToUse = (uchar *)strdup((pData->templateName == NULL) ? "RSYSLOG_FileFormat" : (char *)pData->templateName);
 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS));
-	if (pData->includeTimeGenerated) {
-		CHKiRet(OMSRsetEntry(*ppOMSR, 1, (uchar *)strdup(" AZUREDCE_TimeGenerated"), OMSR_NO_RQD_TPL_OPTS));
-	}
 
 	CODE_STD_FINALIZERnewActInst;
 	cnfparamvalsDestruct(pvals, &actpblk);
@@ -886,7 +799,6 @@ BEGINqueryEtryPt
 ENDqueryEtryPt
 
 BEGINmodInit()
-	uchar *pTmp;
 	CODESTARTmodInit;
 	*ipIFVersProvided = CURR_MOD_IF_VERSION;
 	CODEmodInit_QueryRegCFSLineHdlr
@@ -894,8 +806,6 @@ BEGINmodInit()
 		LogError(0, RS_RET_OBJ_CREATION_FAILED, "omazuredce: curl_global_init failed");
 		ABORT_FINALIZE(RS_RET_OBJ_CREATION_FAILED);
 	}
-	pTmp = (uchar *)AZUREDCE_TimeGenerated;
-	tplAddLine(ourConf, " AZUREDCE_TimeGenerated", &pTmp);
 	DBGPRINTF("omazuredce: modInit complete\n");
 ENDmodInit
 
