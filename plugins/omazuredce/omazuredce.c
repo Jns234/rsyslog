@@ -50,6 +50,8 @@ MODULE_CNFNAME("omazuredce")
     https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/service-limits#logs-ingestion-api */
 #define AZURE_MAX_FIELD_BYTES (64 * 1024)
 #define AZURE_OAUTH_SCOPE "https://monitor.azure.com/.default"
+#define AZURE_AUTH_TOKEN_FALLBACK_LEN 4096
+#define AZURE_HTTP_EXTRA_OVERHEAD 512
 
 /* Since I will be requesting a access token for log forwarding, this will come in useful https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#first-case-access-token-request-with-a-shared-secret*/
 
@@ -233,6 +235,47 @@ static uint64_t nowMs(void) {
 	return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
 }
 
+static size_t decimalDigits(size_t v) {
+	size_t n = 1;
+	while (v >= 10) {
+		v /= 10;
+		++n;
+	}
+	return n;
+}
+
+/* Estimate total HTTP request bytes (headers + body) for max_batch_bytes enforcement. */
+static size_t estimateHttpRequestBytes(const instanceData *pData, size_t payloadLen) {
+	const char *dce = (const char *)pData->dceURL;
+	size_t dceLen = (dce == NULL) ? 0 : strlen(dce);
+	size_t slashLen = 0;
+	size_t dcrLen = (pData->dcrID == NULL) ? 0 : strlen((const char *)pData->dcrID);
+	size_t tableLen = (pData->tableName == NULL) ? 0 : strlen((const char *)pData->tableName);
+	size_t tokenLen = (pData->accessToken == NULL || pData->accessToken[0] == '\0')
+				  ? AZURE_AUTH_TOKEN_FALLBACK_LEN
+				  : strlen((const char *)pData->accessToken);
+	size_t urlLen;
+	size_t total;
+
+	if (dceLen > 0 && dce[dceLen - 1] != '/') {
+		slashLen = 1;
+	}
+
+	urlLen = dceLen + slashLen + strlen("dataCollectionRules/") + dcrLen + strlen("/streams/") + tableLen +
+		 strlen("?api-version=2023-01-01");
+
+	total = payloadLen;
+	total += strlen("POST ") + urlLen + strlen(" HTTP/1.1\r\n");
+	total += strlen("Host: ") + urlLen + strlen("\r\n");
+	total += strlen("Content-Type: application/json\r\n");
+	total += strlen("Authorization: Bearer ") + tokenLen + strlen("\r\n");
+	total += strlen("Content-Length: ") + decimalDigits(payloadLen) + strlen("\r\n");
+	total += strlen("\r\n");
+	total += AZURE_HTTP_EXTRA_OVERHEAD;
+
+	return total;
+}
+
 static rsRetVal postBatchToAzure(instanceData *pData, wrkrInstanceData_t *pWrkrData, size_t payloadLen) {
 	const char *urlSuffixFmt = "dataCollectionRules/%s/streams/%s?api-version=2023-01-01";
 	const char *slash = "";
@@ -271,6 +314,14 @@ static rsRetVal postBatchToAzure(instanceData *pData, wrkrInstanceData_t *pWrkrD
 	snprintf(url + strlen(url), urlLen - strlen(url), urlSuffixFmt, (char *)pData->dcrID, (char *)pData->tableName);
 
 	for (attempt = 0; attempt < 2; ++attempt) {
+		const size_t requestLen = estimateHttpRequestBytes(pData, payloadLen);
+		if (requestLen > (size_t)pData->maxBatchBytes) {
+			LogError(0, RS_RET_ERR,
+				 "omazuredce: batch exceeds max request size before send, payload_bytes=%zu estimated_request_bytes=%zu max_batch_bytes=%d",
+				 payloadLen, requestLen, pData->maxBatchBytes);
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+
 		curl = curl_easy_init();
 		if (curl == NULL) {
 			LogError(0, RS_RET_ERR, "omazuredce: curl_easy_init failed while posting batch");
@@ -429,6 +480,7 @@ static void resetBatch(wrkrInstanceData_t *pWrkrData) {
 static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
 	instanceData *const pData = pWrkrData->pData;
 	size_t payloadLen;
+	size_t requestLen;
 	DEFiRet;
 	DBGPRINTF("omazuredce[%p]: flushBatch enter, records=%zu currentLen=%zu\n", pWrkrData, pWrkrData->recordCount,
 		  pWrkrData->batchLen);
@@ -440,6 +492,14 @@ static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
 	CHKiRet(appendChar(pWrkrData, ']'));
 	payloadLen = pWrkrData->batchLen;
 	pWrkrData->batchBuf[payloadLen] = '\0';
+	requestLen = estimateHttpRequestBytes(pData, payloadLen);
+	if (requestLen > (size_t)pData->maxBatchBytes) {
+		LogError(0, RS_RET_ERR,
+			 "omazuredce: dropping over-sized batch, payload_bytes=%zu estimated_request_bytes=%zu max_batch_bytes=%d",
+			 payloadLen, requestLen, pData->maxBatchBytes);
+		resetBatch(pWrkrData);
+		FINALIZE;
+	}
 	DBGPRINTF("omazuredce[%p]: flush batch posting records=%zu payloadBytes=%zu payload='%s'\n", pWrkrData,
 		  pWrkrData->recordCount, payloadLen, pWrkrData->batchBuf);
 	CHKiRet(postBatchToAzure(pData, pWrkrData, payloadLen));
@@ -472,14 +532,14 @@ finalize_it:
 	RETiRet;
 }
 
-static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const char *msg, const char *timeGenerated) {
+static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const char *msg) {
 	char *recordJson = NULL;
 	size_t recordLen = 0;
 	const size_t maxBatchBytes = (size_t)pWrkrData->pData->maxBatchBytes;
 	size_t recLen;
 	size_t projectedLen;
+	size_t projectedRequestLen;
 	DEFiRet;
-	(void)timeGenerated;
 	CHKiRet(buildRecordJson(msg, &recordJson, &recordLen));
 	recLen = (pWrkrData->recordCount > 0 ? 1 : 0) + recordLen;
 	DBGPRINTF("omazuredce[%p]: add message recordLen=%zu currentBatchLen=%zu\n", pWrkrData, recLen,
@@ -487,16 +547,18 @@ static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const c
 
 	/* +1 reserves room for the trailing ']' when the batch is flushed */
 	projectedLen = pWrkrData->batchLen + recLen + 1;
-	if (projectedLen > maxBatchBytes && pWrkrData->recordCount > 0) {
+	projectedRequestLen = estimateHttpRequestBytes(pWrkrData->pData, projectedLen);
+	if ((projectedLen > maxBatchBytes || projectedRequestLen > maxBatchBytes) && pWrkrData->recordCount > 0) {
 		DBGPRINTF("omazuredce[%p]: batch limit reached, forcing flush before append\n", pWrkrData);
 		CHKiRet(flushBatchUnlocked(pWrkrData));
 		projectedLen = pWrkrData->batchLen + recLen + 1;
+		projectedRequestLen = estimateHttpRequestBytes(pWrkrData->pData, projectedLen);
 	}
 
-	if (projectedLen > maxBatchBytes) {
+	if (projectedLen > maxBatchBytes || projectedRequestLen > maxBatchBytes) {
 		LogError(0, RS_RET_ERR,
-			 "omazuredce: dropping over-sized log record, record_len=%zu max_batch_bytes=%d", recordLen,
-			 pWrkrData->pData->maxBatchBytes);
+			 "omazuredce: dropping over-sized log record, record_len=%zu projected_payload_bytes=%zu projected_request_bytes=%zu max_batch_bytes=%d",
+			 recordLen, projectedLen, projectedRequestLen, pWrkrData->pData->maxBatchBytes);
 		ABORT_FINALIZE(RS_RET_OK);
 	}
 
@@ -690,7 +752,7 @@ BEGINdoAction
 		ABORT_FINALIZE(RS_RET_SYS_ERR);
 	}
 	lockHeld = 1;
-	CHKiRet(addMessageToBatchUnlocked(pWrkrData, msg, NULL));
+	CHKiRet(addMessageToBatchUnlocked(pWrkrData, msg));
 	recCnt = pWrkrData->recordCount;
 	pWrkrData->lastMessageTimeMs = nowMs();
 	if (pthread_mutex_unlock(&pWrkrData->batchLock) != 0) {
