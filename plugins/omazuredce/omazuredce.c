@@ -1,0 +1,875 @@
+/* omazuredce.c
+ * Prototype output module for Azure Monitor Logs Ingestion API (DCE/DCR).
+ *
+ * This module batches messages into JSON under 1 MiB and posts each batch to
+ * the Azure Monitor Logs Ingestion API endpoint.
+ *
+ * Copyright 2026 Adiscon GmbH.
+ *
+ * This file is part of rsyslog.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *       -or-
+ *       see COPYING.ASL20 in the source distribution
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "config.h"
+#include "rsyslog.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <json.h>
+#include <curl/curl.h>
+#include "conf.h"
+#include "syslogd-types.h"
+#include "srUtils.h"
+#include "template.h"
+#include "module-template.h"
+#include "errmsg.h"
+
+MODULE_TYPE_OUTPUT;
+MODULE_TYPE_NOKEEP;
+MODULE_CNFNAME("omazuredce")
+
+/* The maximum size of an API call to the Azure Log Ingestion API is 1MB, which (I assume) means that the call itself with the headers and so on must not exceed this size */
+#define AZURE_MAX_BATCH_BYTES (1024 * 1024)
+
+/* The max size of field values is 64KB, when that limit is reached the rest is turnecated. Not sure if this applies to the whole batch or per individual item in Batch 
+    https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/service-limits#logs-ingestion-api */
+#define AZURE_MAX_FIELD_BYTES (64 * 1024)
+#define AZURE_OAUTH_SCOPE "https://monitor.azure.com/.default"
+#define AZURE_AUTH_TOKEN_FALLBACK_LEN 4096
+#define AZURE_HTTP_EXTRA_OVERHEAD 512
+
+/* Since I will be requesting a access token for log forwarding, this will come in useful https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#first-case-access-token-request-with-a-shared-secret*/
+
+DEF_OMOD_STATIC_DATA;
+
+typedef struct _instanceData {
+	uchar *templateName;
+	uchar *clientID;
+	uchar *clientSecret;
+	uchar *tenantID;
+	uchar *dceURL;
+	uchar *dcrID;
+	uchar *tableName;
+	uchar *accessToken;
+	int maxBatchBytes;
+	int flushTimeoutMs;
+} instanceData;
+
+typedef struct wrkrInstanceData {
+	instanceData *pData;
+	char *batchBuf; /* active JSON array, always starts with '[' */
+	size_t batchLen;
+	size_t recordCount;
+	uint64_t lastMessageTimeMs;
+	pthread_mutex_t batchLock;
+	pthread_t timerThread;
+	sbool timerThreadRunning;
+	sbool stopTimerThread;
+} wrkrInstanceData_t;
+
+static struct cnfparamdescr actpdescr[] = {
+	{"template", eCmdHdlrGetWord, 0},
+	{"client_id", eCmdHdlrString, 0},
+	{"client_secret", eCmdHdlrString, 0},
+	{"tenant_id", eCmdHdlrString, 0},
+	{"dce_url", eCmdHdlrString, 0},
+	{"dcr_id", eCmdHdlrString, 0},
+	{"table_name", eCmdHdlrString, 0},
+	{"max_batch_bytes", eCmdHdlrInt, 0},
+	{"flush_timeout_ms", eCmdHdlrNonNegInt, 0}
+};
+static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
+
+struct modConfData_s {
+	rsconf_t *pConf;
+};
+static modConfData_t *runModConf = NULL;
+
+static inline const char *safeStr(const uchar *s) {
+	return (s == NULL) ? "<unset>" : (const char *)s;
+}
+
+typedef struct tokenRespBuf_s {
+	char *data;
+	size_t len;
+} tokenRespBuf_t;
+
+static size_t tokenWriteCb(void *contents, size_t size, size_t nmemb, void *userp) {
+	const size_t realsz = size * nmemb;
+	tokenRespBuf_t *buf = (tokenRespBuf_t *)userp;
+	char *newData = realloc(buf->data, buf->len + realsz + 1);
+	if (newData == NULL) {
+		return 0;
+	}
+	buf->data = newData;
+	memcpy(buf->data + buf->len, contents, realsz);
+	buf->len += realsz;
+	buf->data[buf->len] = '\0';
+	return realsz;
+}
+
+static rsRetVal requestAccessToken(instanceData *pData) {
+	char tokenURL[512];
+	char *body = NULL;
+	char *escClientID = NULL;
+	char *escClientSecret = NULL;
+	char *escScope = NULL;
+	CURL *curl = NULL;
+	CURLcode curlRes;
+	long httpCode = 0;
+	size_t bodyLen;
+	struct curl_slist *headers = NULL;
+	tokenRespBuf_t response = {NULL, 0};
+	char *token = NULL;
+	struct json_object *tokenResp = NULL;
+	struct json_object *tokenField = NULL;
+	const char *tokenStr = NULL;
+	DEFiRet;
+
+	if (pData->clientID == NULL || pData->clientSecret == NULL || pData->tenantID == NULL) {
+		LogError(0, RS_RET_PARAM_ERROR,
+			 "omazuredce: cannot request access token, missing one of client_id/client_secret/tenant_id");
+		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+	}
+
+	if (snprintf(tokenURL, sizeof(tokenURL), "https://login.microsoftonline.com/%s/oauth2/v2.0/token",
+		     (char *)pData->tenantID) <= 0) {
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	curl = curl_easy_init();
+	if (curl == NULL) {
+		LogError(0, RS_RET_ERR, "omazuredce: curl_easy_init failed while requesting access token");
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	escClientID = curl_easy_escape(curl, (char *)pData->clientID, 0);
+	escClientSecret = curl_easy_escape(curl, (char *)pData->clientSecret, 0);
+	escScope = curl_easy_escape(curl, AZURE_OAUTH_SCOPE, 0);
+	if (escClientID == NULL || escClientSecret == NULL || escScope == NULL) {
+		LogError(0, RS_RET_ERR, "omazuredce: failed escaping OAuth form values");
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	bodyLen = strlen("client_id=&scope=&client_secret=&grant_type=client_credentials") + strlen(escClientID) +
+		  strlen(escScope) + strlen(escClientSecret) + 1;
+	body = malloc(bodyLen);
+	if (body == NULL) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+
+	snprintf(body, bodyLen, "client_id=%s&scope=%s&client_secret=%s&grant_type=client_credentials", escClientID,
+		 escScope, escClientSecret);
+
+	headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+	curl_easy_setopt(curl, CURLOPT_URL, tokenURL);
+	curl_easy_setopt(curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, tokenWriteCb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+
+	DBGPRINTF("omazuredce: requesting OAuth token for tenant_id='%s' client_id='%s'\n", safeStr(pData->tenantID),
+		  safeStr(pData->clientID));
+	curlRes = curl_easy_perform(curl);
+	if (curlRes != CURLE_OK) {
+		LogError(0, RS_RET_IO_ERROR, "omazuredce: token request failed: %s", curl_easy_strerror(curlRes));
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+	if (httpCode < 200 || httpCode >= 300) {
+		LogError(0, RS_RET_IO_ERROR, "omazuredce: token request HTTP status=%ld response='%s'", httpCode,
+			 response.data == NULL ? "" : response.data);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+
+	tokenResp = json_tokener_parse(response.data == NULL ? "" : response.data);
+	if (tokenResp == NULL || !json_object_object_get_ex(tokenResp, "access_token", &tokenField) ||
+	    !json_object_is_type(tokenField, json_type_string)) {
+		LogError(0, RS_RET_IO_ERROR, "omazuredce: access_token not found in token response");
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+	tokenStr = json_object_get_string(tokenField);
+	if (tokenStr == NULL || tokenStr[0] == '\0') {
+		LogError(0, RS_RET_IO_ERROR, "omazuredce: access_token is empty in token response");
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+	CHKmalloc(token = strdup(tokenStr));
+
+	free(pData->accessToken);
+	pData->accessToken = (uchar *)token;
+	token = NULL;
+	DBGPRINTF("omazuredce: access token acquired successfully (len=%zu)\n", strlen((char *)pData->accessToken));
+
+finalize_it:
+	if (token != NULL) free(token);
+	free(response.data);
+	free(body);
+	if (escClientID != NULL) curl_free(escClientID);
+	if (escClientSecret != NULL) curl_free(escClientSecret);
+	if (escScope != NULL) curl_free(escScope);
+	if (headers != NULL) curl_slist_free_all(headers);
+	if (curl != NULL) curl_easy_cleanup(curl);
+	if (tokenResp != NULL) json_object_put(tokenResp);
+	RETiRet;
+}
+
+static uint64_t nowMs(void) {
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
+}
+
+static size_t decimalDigits(size_t v) {
+	size_t n = 1;
+	while (v >= 10) {
+		v /= 10;
+		++n;
+	}
+	return n;
+}
+
+/* Estimate total HTTP request bytes (headers + body) for max_batch_bytes enforcement. */
+static size_t estimateHttpRequestBytes(const instanceData *pData, size_t payloadLen) {
+	const char *dce = (const char *)pData->dceURL;
+	size_t dceLen = (dce == NULL) ? 0 : strlen(dce);
+	size_t slashLen = 0;
+	size_t dcrLen = (pData->dcrID == NULL) ? 0 : strlen((const char *)pData->dcrID);
+	size_t tableLen = (pData->tableName == NULL) ? 0 : strlen((const char *)pData->tableName);
+	size_t tokenLen = (pData->accessToken == NULL || pData->accessToken[0] == '\0')
+				  ? AZURE_AUTH_TOKEN_FALLBACK_LEN
+				  : strlen((const char *)pData->accessToken);
+	size_t urlLen;
+	size_t total;
+
+	if (dceLen > 0 && dce[dceLen - 1] != '/') {
+		slashLen = 1;
+	}
+
+	urlLen = dceLen + slashLen + strlen("dataCollectionRules/") + dcrLen + strlen("/streams/") + tableLen +
+		 strlen("?api-version=2023-01-01");
+
+	total = payloadLen;
+	total += strlen("POST ") + urlLen + strlen(" HTTP/1.1\r\n");
+	total += strlen("Host: ") + urlLen + strlen("\r\n");
+	total += strlen("Content-Type: application/json\r\n");
+	total += strlen("Authorization: Bearer ") + tokenLen + strlen("\r\n");
+	total += strlen("Content-Length: ") + decimalDigits(payloadLen) + strlen("\r\n");
+	total += strlen("\r\n");
+	total += AZURE_HTTP_EXTRA_OVERHEAD;
+
+	return total;
+}
+
+static rsRetVal postBatchToAzure(instanceData *pData, wrkrInstanceData_t *pWrkrData, size_t payloadLen) {
+	const char *urlSuffixFmt = "dataCollectionRules/%s/streams/%s?api-version=2023-01-01";
+	const char *slash = "";
+	char *url = NULL;
+	char *authHeader = NULL;
+	char *dce = NULL;
+	size_t urlLen;
+	CURL *curl = NULL;
+	CURLcode curlRes;
+	long httpCode = 0;
+	tokenRespBuf_t response = {NULL, 0};
+	struct curl_slist *headers = NULL;
+	int attempt;
+	DEFiRet;
+
+	if (pData->dceURL == NULL || pData->dcrID == NULL || pData->tableName == NULL) {
+		LogError(0, RS_RET_PARAM_ERROR,
+			 "omazuredce: cannot post batch, missing one of dce_url/dcr_id/table_name");
+		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+	}
+
+	if (pData->accessToken == NULL || pData->accessToken[0] == '\0') {
+		CHKiRet(requestAccessToken(pData));
+	}
+
+	dce = (char *)pData->dceURL;
+	if (dce[0] != '\0' && dce[strlen(dce) - 1] == '/') {
+		slash = "";
+	} else {
+		slash = "/";
+	}
+	urlLen = strlen(dce) + strlen(slash) + strlen("/dataCollectionRules/") + strlen((char *)pData->dcrID) +
+		 strlen("/streams/") + strlen((char *)pData->tableName) + strlen("?api-version=2023-01-01") + 1;
+	CHKmalloc(url = malloc(urlLen));
+	snprintf(url, urlLen, "%s%s", dce, slash);
+	snprintf(url + strlen(url), urlLen - strlen(url), urlSuffixFmt, (char *)pData->dcrID, (char *)pData->tableName);
+
+	for (attempt = 0; attempt < 2; ++attempt) {
+		const size_t requestLen = estimateHttpRequestBytes(pData, payloadLen);
+		if (requestLen > (size_t)pData->maxBatchBytes) {
+			LogError(0, RS_RET_ERR,
+				 "omazuredce: batch exceeds max request size before send, payload_bytes=%zu estimated_request_bytes=%zu max_batch_bytes=%d",
+				 payloadLen, requestLen, pData->maxBatchBytes);
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+
+		curl = curl_easy_init();
+		if (curl == NULL) {
+			LogError(0, RS_RET_ERR, "omazuredce: curl_easy_init failed while posting batch");
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+
+		CHKmalloc(authHeader = malloc(strlen("Authorization: Bearer ") + strlen((char *)pData->accessToken) + 1));
+		snprintf(authHeader, strlen("Authorization: Bearer ") + strlen((char *)pData->accessToken) + 1,
+			 "Authorization: Bearer %s", (char *)pData->accessToken);
+
+		headers = curl_slist_append(headers, "Content-Type: application/json");
+		headers = curl_slist_append(headers, authHeader);
+		curl_easy_setopt(curl, CURLOPT_URL, url);
+		curl_easy_setopt(curl, CURLOPT_POST, 1L);
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, pWrkrData->batchBuf);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)payloadLen);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, tokenWriteCb);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+
+		DBGPRINTF("omazuredce: posting batch url='%s' bytes=%zu attempt=%d\n", url, payloadLen, attempt + 1);
+		curlRes = curl_easy_perform(curl);
+		if (curlRes != CURLE_OK) {
+			LogError(0, RS_RET_IO_ERROR, "omazuredce: batch post failed: %s", curl_easy_strerror(curlRes));
+			ABORT_FINALIZE(RS_RET_IO_ERROR);
+		}
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+		if (httpCode >= 200 && httpCode < 300) {
+			DBGPRINTF("omazuredce: batch post successful status=%ld response='%s'\n", httpCode,
+				  response.data == NULL ? "" : response.data);
+			LogMsg(0, RS_RET_OK, LOG_INFO, "omazuredce: posted batch records=%ld stream=%s",
+			       pWrkrData->recordCount, safeStr(pData->tableName));
+			FINALIZE;
+		}
+		if (httpCode == 401 && attempt == 0) {
+			DBGPRINTF("omazuredce: batch post got 401, refreshing access token and retrying\n");
+			CHKiRet(requestAccessToken(pData));
+			free(response.data);
+			response.data = NULL;
+			response.len = 0;
+			curl_slist_free_all(headers);
+			headers = NULL;
+			curl_easy_cleanup(curl);
+			curl = NULL;
+			free(authHeader);
+			authHeader = NULL;
+			continue;
+		}
+		LogError(0, RS_RET_IO_ERROR, "omazuredce: batch post HTTP status=%ld response='%s'", httpCode,
+			 response.data == NULL ? "" : response.data);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+
+finalize_it:
+	free(url);
+	free(authHeader);
+	free(response.data);
+	if (headers != NULL) curl_slist_free_all(headers);
+	if (curl != NULL) curl_easy_cleanup(curl);
+	RETiRet;
+}
+
+static rsRetVal appendChar(wrkrInstanceData_t *pWrkrData, const char c) {
+	DEFiRet;
+	if (pWrkrData->batchLen + 1 > (size_t)pWrkrData->pData->maxBatchBytes) {
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+	pWrkrData->batchBuf[pWrkrData->batchLen++] = c;
+finalize_it:
+	RETiRet;
+}
+
+static rsRetVal appendRaw(wrkrInstanceData_t *pWrkrData, const char *s, const size_t len) {
+	DEFiRet;
+	if (pWrkrData->batchLen + len > (size_t)pWrkrData->pData->maxBatchBytes) {
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+	memcpy(pWrkrData->batchBuf + pWrkrData->batchLen, s, len);
+	pWrkrData->batchLen += len;
+finalize_it:
+	RETiRet;
+}
+
+static rsRetVal mergeJsonObjectText(struct json_object *recordObj, const char *jsonText, const char *srcName) {
+	struct json_object *parsedObj = NULL;
+	struct json_object_iterator iter;
+	struct json_object_iterator iterEnd;
+	DEFiRet;
+
+	if (jsonText == NULL || jsonText[0] == '\0') {
+		FINALIZE;
+	}
+
+	parsedObj = json_tokener_parse(jsonText);
+	if (parsedObj == NULL || !json_object_is_type(parsedObj, json_type_object)) {
+		LogError(0, RS_RET_ERR, "omazuredce: %s template must render JSON object, got: '%s'", srcName, jsonText);
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	iter = json_object_iter_begin(parsedObj);
+	iterEnd = json_object_iter_end(parsedObj);
+	while (!json_object_iter_equal(&iter, &iterEnd)) {
+		const char *key = json_object_iter_peek_name(&iter);
+		struct json_object *value = json_object_iter_peek_value(&iter);
+		if (key != NULL && value != NULL) {
+			json_object_object_add(recordObj, key, json_object_get(value));
+		}
+		json_object_iter_next(&iter);
+	}
+
+finalize_it:
+	if (parsedObj != NULL) json_object_put(parsedObj);
+	RETiRet;
+}
+
+static rsRetVal buildRecordJson(const char *msg, char **recordJson, size_t *recordLen) {
+	struct json_object *recordObj = NULL;
+	const char *jsonText;
+	DEFiRet;
+
+	*recordJson = NULL;
+	*recordLen = 0;
+	if (msg == NULL) msg = "";
+
+	if ((recordObj = json_object_new_object()) == NULL) {
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
+
+	CHKiRet(mergeJsonObjectText(recordObj, msg, "message"));
+
+	jsonText = json_object_to_json_string_ext(recordObj, JSON_C_TO_STRING_PLAIN);
+	if (jsonText == NULL) {
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+	CHKmalloc(*recordJson = strdup(jsonText));
+	*recordLen = strlen(*recordJson);
+
+finalize_it:
+	if (recordObj != NULL) json_object_put(recordObj);
+	if (iRet != RS_RET_OK) {
+		free(*recordJson);
+		*recordJson = NULL;
+		*recordLen = 0;
+	}
+	RETiRet;
+}
+
+static void resetBatch(wrkrInstanceData_t *pWrkrData) {
+	pWrkrData->batchLen = 0;
+	pWrkrData->recordCount = 0;
+	pWrkrData->batchBuf[pWrkrData->batchLen++] = '[';
+	DBGPRINTF("omazuredce[%p]: reset batch buffer\n", pWrkrData);
+}
+
+static rsRetVal flushBatchUnlocked(wrkrInstanceData_t *pWrkrData) {
+	instanceData *const pData = pWrkrData->pData;
+	size_t payloadLen;
+	size_t requestLen;
+	DEFiRet;
+	DBGPRINTF("omazuredce[%p]: flushBatch enter, records=%zu currentLen=%zu\n", pWrkrData, pWrkrData->recordCount,
+		  pWrkrData->batchLen);
+
+	if (pWrkrData->recordCount == 0) {
+		FINALIZE;
+	}
+
+	CHKiRet(appendChar(pWrkrData, ']'));
+	payloadLen = pWrkrData->batchLen;
+	pWrkrData->batchBuf[payloadLen] = '\0';
+	requestLen = estimateHttpRequestBytes(pData, payloadLen);
+	if (requestLen > (size_t)pData->maxBatchBytes) {
+		LogError(0, RS_RET_ERR,
+			 "omazuredce: dropping over-sized batch, payload_bytes=%zu estimated_request_bytes=%zu max_batch_bytes=%d",
+			 payloadLen, requestLen, pData->maxBatchBytes);
+		resetBatch(pWrkrData);
+		FINALIZE;
+	}
+	DBGPRINTF("omazuredce[%p]: flush batch posting records=%zu payloadBytes=%zu payload='%s'\n", pWrkrData,
+		  pWrkrData->recordCount, payloadLen, pWrkrData->batchBuf);
+	CHKiRet(postBatchToAzure(pData, pWrkrData, payloadLen));
+	DBGPRINTF("omazuredce[%p]: flushed batch records=%zu payloadBytes=%zu\n", pWrkrData, pWrkrData->recordCount,
+		  payloadLen);
+
+	resetBatch(pWrkrData);
+
+finalize_it:
+	RETiRet;
+}
+
+static rsRetVal flushBatch(wrkrInstanceData_t *pWrkrData) {
+	DEFiRet;
+	int lockHeld = 0;
+	if (pthread_mutex_lock(&pWrkrData->batchLock) != 0) {
+		ABORT_FINALIZE(RS_RET_SYS_ERR);
+	}
+	lockHeld = 1;
+	CHKiRet(flushBatchUnlocked(pWrkrData));
+	if (pthread_mutex_unlock(&pWrkrData->batchLock) != 0) {
+		lockHeld = 0;
+		ABORT_FINALIZE(RS_RET_SYS_ERR);
+	}
+	lockHeld = 0;
+finalize_it:
+	if (lockHeld) {
+		(void)pthread_mutex_unlock(&pWrkrData->batchLock);
+	}
+	RETiRet;
+}
+
+static rsRetVal addMessageToBatchUnlocked(wrkrInstanceData_t *pWrkrData, const char *msg) {
+	char *recordJson = NULL;
+	size_t recordLen = 0;
+	const size_t maxBatchBytes = (size_t)pWrkrData->pData->maxBatchBytes;
+	size_t recLen;
+	size_t projectedLen;
+	size_t projectedRequestLen;
+	DEFiRet;
+	CHKiRet(buildRecordJson(msg, &recordJson, &recordLen));
+	recLen = (pWrkrData->recordCount > 0 ? 1 : 0) + recordLen;
+	DBGPRINTF("omazuredce[%p]: add message recordLen=%zu currentBatchLen=%zu\n", pWrkrData, recLen,
+		  pWrkrData->batchLen);
+
+	/* +1 reserves room for the trailing ']' when the batch is flushed */
+	projectedLen = pWrkrData->batchLen + recLen + 1;
+	projectedRequestLen = estimateHttpRequestBytes(pWrkrData->pData, projectedLen);
+	if ((projectedLen > maxBatchBytes || projectedRequestLen > maxBatchBytes) && pWrkrData->recordCount > 0) {
+		DBGPRINTF("omazuredce[%p]: batch limit reached, forcing flush before append\n", pWrkrData);
+		CHKiRet(flushBatchUnlocked(pWrkrData));
+		projectedLen = pWrkrData->batchLen + recLen + 1;
+		projectedRequestLen = estimateHttpRequestBytes(pWrkrData->pData, projectedLen);
+	}
+
+	if (projectedLen > maxBatchBytes || projectedRequestLen > maxBatchBytes) {
+		LogError(0, RS_RET_ERR,
+			 "omazuredce: dropping over-sized log record, record_len=%zu projected_payload_bytes=%zu projected_request_bytes=%zu max_batch_bytes=%d",
+			 recordLen, projectedLen, projectedRequestLen, pWrkrData->pData->maxBatchBytes);
+		ABORT_FINALIZE(RS_RET_OK);
+	}
+
+	if (pWrkrData->recordCount > 0) CHKiRet(appendChar(pWrkrData, ','));
+	CHKiRet(appendRaw(pWrkrData, recordJson, recordLen));
+	pWrkrData->recordCount++;
+	DBGPRINTF("omazuredce[%p]: message appended, recordCount=%zu batchLen=%zu\n", pWrkrData, pWrkrData->recordCount,
+		  pWrkrData->batchLen);
+
+finalize_it:
+	free(recordJson);
+	RETiRet;
+}
+
+static void *batchTimerThread(void *arg) {
+	wrkrInstanceData_t *const pWrkrData = (wrkrInstanceData_t *)arg;
+	instanceData *const pData = pWrkrData->pData;
+	DBGPRINTF("omazuredce[%p]: timer thread started with flush_timeout_ms=%d\n", pWrkrData, pData->flushTimeoutMs);
+
+	while (!pWrkrData->stopTimerThread) {
+		if (pData->flushTimeoutMs <= 0) {
+			srSleep(0, 100000);
+			continue;
+		}
+
+		if (pthread_mutex_lock(&pWrkrData->batchLock) == 0) {
+			if (pWrkrData->recordCount > 0) {
+				const uint64_t now = nowMs();
+				const uint64_t elapsed = (now >= pWrkrData->lastMessageTimeMs) ? (now - pWrkrData->lastMessageTimeMs) : 0;
+				if (elapsed >= (uint64_t)pData->flushTimeoutMs) {
+					DBGPRINTF("omazuredce[%p]: timer flush triggered elapsed=%llums records=%zu\n", pWrkrData,
+						  (unsigned long long)elapsed, pWrkrData->recordCount);
+					(void)flushBatchUnlocked(pWrkrData);
+				}
+			}
+			pthread_mutex_unlock(&pWrkrData->batchLock);
+		}
+		srSleep(0, 10000); /* 10ms check interval */
+	}
+
+	DBGPRINTF("omazuredce[%p]: timer thread exiting\n", pWrkrData);
+	return NULL;
+}
+
+static inline void setInstParamDefaults(instanceData *pData) {
+	pData->templateName = NULL;
+	pData->clientID = NULL;
+	pData->clientSecret = NULL;
+	pData->tenantID = NULL;
+	pData->dceURL = NULL;
+	pData->dcrID = NULL;
+	pData->tableName = NULL;
+	pData->accessToken = NULL;
+	pData->maxBatchBytes = AZURE_MAX_BATCH_BYTES;
+	pData->flushTimeoutMs = 1000;
+}
+
+BEGINbeginCnfLoad
+	CODESTARTbeginCnfLoad;
+	DBGPRINTF("omazuredce: beginCnfLoad\n");
+ENDbeginCnfLoad
+
+BEGINendCnfLoad
+	CODESTARTendCnfLoad;
+	DBGPRINTF("omazuredce: endCnfLoad\n");
+ENDendCnfLoad
+
+BEGINcheckCnf
+	CODESTARTcheckCnf;
+	DBGPRINTF("omazuredce: checkCnf\n");
+ENDcheckCnf
+
+BEGINactivateCnf
+	CODESTARTactivateCnf;
+	runModConf = pModConf;
+	DBGPRINTF("omazuredce: activateCnf runModConf=%p\n", runModConf);
+ENDactivateCnf
+
+BEGINfreeCnf
+	CODESTARTfreeCnf;
+	DBGPRINTF("omazuredce: freeCnf\n");
+ENDfreeCnf
+
+BEGINcreateInstance
+	CODESTARTcreateInstance;
+	DBGPRINTF("omazuredce: createInstance[%p]\n", pData);
+ENDcreateInstance
+
+BEGINcreateWrkrInstance
+	int mutexInit = 0;
+	CODESTARTcreateWrkrInstance;
+	DBGPRINTF("omazuredce: createWrkrInstance[%p] maxBatchBytes=%d flushTimeoutMs=%d\n", pWrkrData,
+		  pWrkrData->pData->maxBatchBytes, pWrkrData->pData->flushTimeoutMs);
+	pWrkrData->lastMessageTimeMs = nowMs();
+	pWrkrData->timerThreadRunning = 0;
+	pWrkrData->stopTimerThread = 0;
+	CHKmalloc(pWrkrData->batchBuf = malloc((size_t)pWrkrData->pData->maxBatchBytes + 1));
+	if (pthread_mutex_init(&pWrkrData->batchLock, NULL) != 0) {
+		ABORT_FINALIZE(RS_RET_SYS_ERR);
+	}
+	mutexInit = 1;
+	resetBatch(pWrkrData);
+	CHKiRet(requestAccessToken(pWrkrData->pData));
+	if (pthread_create(&pWrkrData->timerThread, NULL, batchTimerThread, pWrkrData) != 0) {
+		ABORT_FINALIZE(RS_RET_SYS_ERR);
+	}
+	pWrkrData->timerThreadRunning = 1;
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		if (pWrkrData->timerThreadRunning) {
+			pWrkrData->stopTimerThread = 1;
+			pthread_join(pWrkrData->timerThread, NULL);
+			pWrkrData->timerThreadRunning = 0;
+		}
+		if (mutexInit) pthread_mutex_destroy(&pWrkrData->batchLock);
+		free(pWrkrData->batchBuf);
+		pWrkrData->batchBuf = NULL;
+	}
+	DBGPRINTF("omazuredce: createWrkrInstance[%p] ret=%d\n", pWrkrData, iRet);
+ENDcreateWrkrInstance
+
+BEGINisCompatibleWithFeature
+	CODESTARTisCompatibleWithFeature;
+	if (eFeat == sFEATURERepeatedMsgReduction) iRet = RS_RET_OK;
+ENDisCompatibleWithFeature
+
+BEGINfreeInstance
+	CODESTARTfreeInstance;
+	DBGPRINTF("omazuredce: freeInstance[%p]\n", pData);
+	free(pData->clientID);
+	free(pData->clientSecret);
+	free(pData->tenantID);
+	free(pData->dceURL);
+	free(pData->dcrID);
+	free(pData->tableName);
+	free(pData->accessToken);
+	free(pData->templateName);
+ENDfreeInstance
+
+BEGINfreeWrkrInstance
+	CODESTARTfreeWrkrInstance;
+	DBGPRINTF("omazuredce: freeWrkrInstance[%p]\n", pWrkrData);
+	pWrkrData->stopTimerThread = 1;
+	if (pWrkrData->timerThreadRunning) {
+		pthread_join(pWrkrData->timerThread, NULL);
+		pWrkrData->timerThreadRunning = 0;
+	}
+	CHKiRet(flushBatch(pWrkrData));
+finalize_it:
+	pthread_mutex_destroy(&pWrkrData->batchLock);
+	free(pWrkrData->batchBuf);
+ENDfreeWrkrInstance
+
+BEGINdbgPrintInstInfo
+	CODESTARTdbgPrintInstInfo;
+	dbgprintf("omazuredce\n");
+	dbgprintf("\ttemplate='%s'\n", safeStr(pData->templateName));
+	dbgprintf("\tclient_id='%s'\n", safeStr(pData->clientID));
+	dbgprintf("\ttenant_id='%s'\n", safeStr(pData->tenantID));
+	dbgprintf("\tdce_url='%s'\n", safeStr(pData->dceURL));
+	dbgprintf("\tdcr_id='%s'\n", safeStr(pData->dcrID));
+	dbgprintf("\ttable_name='%s'\n", safeStr(pData->tableName));
+	dbgprintf("\tmax_batch_bytes='%d'\n", pData->maxBatchBytes);
+	dbgprintf("\tflush_timeout_ms='%d'\n", pData->flushTimeoutMs);
+	dbgprintf("\taccess_token=%s\n", pData->accessToken == NULL ? "<unset>" : "<set>");
+ENDdbgPrintInstInfo
+
+BEGINtryResume
+	CODESTARTtryResume;
+	DBGPRINTF("omazuredce[%p]: tryResume\n", pWrkrData);
+ENDtryResume
+
+BEGINbeginTransaction
+	CODESTARTbeginTransaction;
+	DBGPRINTF("omazuredce[%p]: beginTransaction\n", pWrkrData);
+ENDbeginTransaction
+
+BEGINdoAction
+	const char *msg;
+	size_t msgLen;
+	int lockHeld = 0;
+	size_t recCnt;
+	CODESTARTdoAction;
+	msg = (ppString != NULL) ? (const char *)ppString[0] : "";
+	if (msg == NULL) msg = "";
+	msgLen = strlen(msg);
+	DBGPRINTF("omazuredce[%p]: doAction msgLen=%zu preview='%.*s%s'\n", pWrkrData, msgLen,
+		  (int)(msgLen > 80 ? 80 : msgLen), msg, (msgLen > 80 ? "..." : ""));
+
+	if (pthread_mutex_lock(&pWrkrData->batchLock) != 0) {
+		ABORT_FINALIZE(RS_RET_SYS_ERR);
+	}
+	lockHeld = 1;
+	CHKiRet(addMessageToBatchUnlocked(pWrkrData, msg));
+	recCnt = pWrkrData->recordCount;
+	pWrkrData->lastMessageTimeMs = nowMs();
+	if (pthread_mutex_unlock(&pWrkrData->batchLock) != 0) {
+		lockHeld = 0;
+		ABORT_FINALIZE(RS_RET_SYS_ERR);
+	}
+	lockHeld = 0;
+	/* Signal queue engine that all previous records are already batched/flushed. */
+	iRet = (recCnt == 1) ? RS_RET_PREVIOUS_COMMITTED : RS_RET_DEFER_COMMIT;
+finalize_it:
+	if (lockHeld) {
+		(void)pthread_mutex_unlock(&pWrkrData->batchLock);
+	}
+	DBGPRINTF("omazuredce[%p]: doAction ret=%d\n", pWrkrData, iRet);
+ENDdoAction
+
+BEGINendTransaction
+	CODESTARTendTransaction;
+	DBGPRINTF("omazuredce[%p]: endTransaction\n", pWrkrData);
+	/* Preserve time-based batching: only force flush when timeout is explicitly disabled. */
+	if (pWrkrData->pData->flushTimeoutMs == 0) {
+		CHKiRet(flushBatch(pWrkrData));
+	}
+finalize_it:
+	DBGPRINTF("omazuredce[%p]: endTransaction ret=%d\n", pWrkrData, iRet);
+ENDendTransaction
+
+BEGINnewActInst
+	struct cnfparamvals *pvals;
+	int i;
+	int nTpls;
+	uchar *tplToUse;
+	CODESTARTnewActInst;
+	DBGPRINTF("omazuredce: newActInst begin\n");
+
+	pvals = nvlstGetParams(lst, &actpblk, NULL);
+	if (pvals == NULL) {
+		LogError(0, RS_RET_MISSING_CNFPARAMS, "omazuredce: error reading config parameters");
+		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+	}
+
+	CHKiRet(createInstance(&pData));
+	setInstParamDefaults(pData);
+
+	for (i = 0; i < actpblk.nParams; ++i) {
+		if (!pvals[i].bUsed) continue;
+
+		if (!strcmp(actpblk.descr[i].name, "template")) {
+			free(pData->templateName);
+			pData->templateName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if (!strcmp(actpblk.descr[i].name, "client_id")) {
+			pData->clientID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if (!strcmp(actpblk.descr[i].name, "client_secret")) {
+			pData->clientSecret = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if (!strcmp(actpblk.descr[i].name, "tenant_id")) {
+			pData->tenantID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if (!strcmp(actpblk.descr[i].name, "dce_url")) {
+			pData->dceURL = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if (!strcmp(actpblk.descr[i].name, "dcr_id")) {
+			pData->dcrID = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if (!strcmp(actpblk.descr[i].name, "table_name")) {
+			pData->tableName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if (!strcmp(actpblk.descr[i].name, "max_batch_bytes")) {
+			pData->maxBatchBytes = (int)pvals[i].val.d.n;
+		} else if (!strcmp(actpblk.descr[i].name, "flush_timeout_ms")) {
+			pData->flushTimeoutMs = (int)pvals[i].val.d.n;
+		}
+	}
+	DBGPRINTF("omazuredce: parsed params template='%s' client_id='%s' tenant_id='%s' dce_url='%s' dcr_id='%s' "
+		  "table_name='%s' max_batch_bytes=%d flush_timeout_ms=%d client_secret=%s\n",
+		  safeStr(pData->templateName), safeStr(pData->clientID), safeStr(pData->tenantID), safeStr(pData->dceURL),
+		  safeStr(pData->dcrID), safeStr(pData->tableName), pData->maxBatchBytes, pData->flushTimeoutMs,
+		  (pData->clientSecret == NULL) ? "<unset>" : "<set>");
+
+	if (pData->maxBatchBytes <= 0 || pData->maxBatchBytes > AZURE_MAX_BATCH_BYTES) {
+		LogError(0, RS_RET_PARAM_ERROR,
+			 "omazuredce: max_batch_bytes must be in range 1..%d, got %d", AZURE_MAX_BATCH_BYTES,
+			 pData->maxBatchBytes);
+		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+	}
+
+	nTpls = 1;
+	CODE_STD_STRING_REQUESTnewActInst(nTpls);
+	tplToUse = (uchar *)strdup((pData->templateName == NULL) ? "RSYSLOG_FileFormat" : (char *)pData->templateName);
+	CHKiRet(OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS));
+
+	CODE_STD_FINALIZERnewActInst;
+	cnfparamvalsDestruct(pvals, &actpblk);
+ENDnewActInst
+
+BEGINmodExit
+	CODESTARTmodExit;
+	DBGPRINTF("omazuredce: modExit\n");
+	curl_global_cleanup();
+ENDmodExit
+
+NO_LEGACY_CONF_parseSelectorAct;
+
+BEGINqueryEtryPt
+	CODESTARTqueryEtryPt;
+	CODEqueryEtryPt_STD_OMOD_QUERIES;
+	CODEqueryEtryPt_TXIF_OMOD_QUERIES;
+	CODEqueryEtryPt_STD_OMOD8_QUERIES;
+	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES;
+	CODEqueryEtryPt_STD_CONF2_QUERIES;
+ENDqueryEtryPt
+
+BEGINmodInit()
+	CODESTARTmodInit;
+	*ipIFVersProvided = CURR_MOD_IF_VERSION;
+	CODEmodInit_QueryRegCFSLineHdlr
+	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
+		LogError(0, RS_RET_OBJ_CREATION_FAILED, "omazuredce: curl_global_init failed");
+		ABORT_FINALIZE(RS_RET_OBJ_CREATION_FAILED);
+	}
+	DBGPRINTF("omazuredce: modInit complete\n");
+ENDmodInit
+
+/* vi:set ai:
+ */
