@@ -1,16 +1,5 @@
 .. _param-omazuredce-flush_timeout_ms:
-<<<<<<< HEAD
-<<<<<<< HEAD
 .. _omazuredce.parameter.action.flush_timeout_ms:
-=======
-.. _omazuredce.parameter.input.flush_timeout_ms:
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-.. _omazuredce.parameter.input.flush_timeout_ms:
-=======
-.. _omazuredce.parameter.action.flush_timeout_ms:
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 .. meta::
    :description: Reference for the omazuredce flush_timeout_ms parameter.
@@ -32,18 +21,7 @@ Controls how long a partially filled batch may stay idle before it is flushed.
 This parameter applies to :doc:`../../configuration/modules/omazuredce`.
 
 :Name: flush_timeout_ms
-<<<<<<< HEAD
-<<<<<<< HEAD
 :Scope: action
-=======
-:Scope: input
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-:Scope: input
-=======
-:Scope: action
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 :Type: non-negative integer
 :Default: 1000
 :Required?: no
@@ -57,26 +35,9 @@ idle batches and flushes them after the configured number of milliseconds.
 When it is set to ``0``, the timer-based flush is disabled and batches are sent
 only when they fill up or when the current action queue transaction ends.
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 Action usage
 ------------
 .. _omazuredce.parameter.action.flush_timeout_ms-usage:
-=======
-Input usage
------------
-.. _omazuredce.parameter.input.flush_timeout_ms-usage:
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-Input usage
------------
-.. _omazuredce.parameter.input.flush_timeout_ms-usage:
-=======
-Action usage
-------------
-.. _omazuredce.parameter.action.flush_timeout_ms-usage:
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 .. code-block:: rsyslog
 

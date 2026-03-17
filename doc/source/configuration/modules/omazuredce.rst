@@ -12,8 +12,6 @@ Ingestion API by using a Data Collection Endpoint (DCE), Data Collection Rule
 
 .. summary-end
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 ******************************************************
 omazuredce: Azure Monitor Logs Ingestion Output Module
 ******************************************************
@@ -53,91 +51,12 @@ Requirements
 To use ``omazuredce``, you need the following:
 
 - ``libcurl`` support at build time
-=======
-=======
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
-omazuredce: Azure Monitor Logs Ingestion output module
-======================================================
-
-Overview
---------
-
-``omazuredce`` is an output module for the Azure Monitor Logs Ingestion API.
-Each message rendered by the configured rsyslog template must be a JSON object.
-The module collects rendered records into a JSON array, requests an OAuth access
-token from Microsoft Entra ID, and posts the resulting batch to the configured
-Azure Data Collection Endpoint.
-
-The module uses size-aware batching. It estimates the total HTTP request size
-before appending a record and flushes the current batch before the configured
-limit would be exceeded. A timer can also flush partially filled batches after
-an idle period.
-
-Availability
-------------
-
-The module is built only when ``./configure`` is invoked with
-``--enable-omazuredce=yes``. The implementation uses ``libcurl`` for HTTP
-requests.
-
-Requirements
-------------
-
-To use ``omazuredce``, you need:
-
-<<<<<<< HEAD
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-=======
-******************************************************
-omazuredce: Azure Monitor Logs Ingestion Output Module
-******************************************************
-
-===========================  ===========================================================================
-**Module Name:**             **omazuredce**
-**Author:**                  Jan Kängsepp
-**Available since:**         v8.2604
-===========================  ===========================================================================
-
-
-Purpose
-=======
-
-This module provides native support for forwarding log data to the Azure
-Monitor Logs Ingestion API.
-
-Each message rendered by the configured template must be a single JSON object.
-``omazuredce`` collects those objects into a JSON array, requests an OAuth
-access token from Microsoft Entra ID, and posts the resulting batch to the
-configured Azure Data Collection Endpoint.
-
-
-Notable Features
-================
-
-- Size-aware batching with a configurable ``max_batch_bytes`` limit
-- Timed flushing for partially filled batches via ``flush_timeout_ms``
-- Automatic OAuth token acquisition for the
-  ``https://monitor.azure.com/.default`` scope
-- Retry-friendly error handling that cooperates with rsyslog action suspension
-
-
-Requirements
-============
-
-To use ``omazuredce``, you need the following:
-
-- ``libcurl`` support at build time
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 - A valid Azure Data Collection Endpoint URL
 - A Data Collection Rule ID
 - A target stream or table name accepted by the DCR
 - A Microsoft Entra application with ``client_id``, ``client_secret``, and
   ``tenant_id`` values that can request tokens for
   ``https://monitor.azure.com/.default``
-<<<<<<< HEAD
-<<<<<<< HEAD
 - A template that renders one valid JSON object per message, or the built-in
   ``StdJSONFmt`` default
 
@@ -159,46 +78,6 @@ Configuration Parameters
 
 Action Parameters
 -----------------
-=======
-=======
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
-- A template that renders one valid JSON object per message
-
-.. warning::
-
-   The current implementation defaults ``template`` to
-   ``RSYSLOG_FileFormat``, but the module only accepts templates that render a
-   JSON object. In practice, you should set ``template`` explicitly.
-
-Configuration Parameters
-------------------------
-<<<<<<< HEAD
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-=======
-- A template that renders one valid JSON object per message, or the built-in
-  ``StdJSONFmt`` default
-
-The module is built only when ``./configure`` is invoked with
-``--enable-omazuredce=yes``.
-
-
-Configuration Parameters
-========================
-
-.. note::
-
-   Parameter names are case-insensitive; snake_case is used in the examples
-   because the module's parameter names contain underscores.
-
-.. note::
-
-   This module supports action parameters only.
-
-Action Parameters
------------------
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 .. list-table::
    :widths: 30 70
@@ -256,24 +135,9 @@ Action Parameters
    ../../reference/parameters/omazuredce-max_batch_bytes
    ../../reference/parameters/omazuredce-flush_timeout_ms
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 
 Batching Behavior
 =================
-=======
-Batching Behavior
------------------
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-Batching Behavior
------------------
-=======
-
-Batching Behavior
-=================
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 ``omazuredce`` builds one JSON array per worker and flushes it when one of the
 following happens:
@@ -285,8 +149,6 @@ following happens:
 The internal size check is conservative. It includes both the JSON payload size
 and an estimate for HTTP headers before sending the request.
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 
 Error Handling
 ==============
@@ -297,53 +159,13 @@ returns ``RS_RET_SUSPENDED``. The failed batch is then retried by rsyslog's
 central action engine according to the configured action backoff and retry
 settings. Other retryable HTTP failures follow the same ``RS_RET_SUSPENDED``
 path.
-=======
-=======
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
-Error Handling
---------------
-
-The module obtains an OAuth access token before sending data. If Azure returns
-``401 Unauthorized`` for a batch request, the module refreshes the token once
-and retries the request.
-<<<<<<< HEAD
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-=======
-
-Error Handling
-==============
-
-The module obtains an OAuth access token before sending data. If Azure returns
-``401 Unauthorized`` for a batch request, the module refreshes the token and
-returns ``RS_RET_SUSPENDED``. The failed batch is then retried by rsyslog's
-central action engine according to the configured action backoff and retry
-settings. Other retryable HTTP failures follow the same ``RS_RET_SUSPENDED``
-path.
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 If a rendered message is too large to fit into an empty batch under the current
 ``max_batch_bytes`` setting, the module logs an error and drops that record.
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 
 Example
 =======
-=======
-Example
--------
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-Example
--------
-=======
-
-Example
-=======
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 The following example renders each event as one JSON object and forwards it to
 Azure Monitor Logs Ingestion:

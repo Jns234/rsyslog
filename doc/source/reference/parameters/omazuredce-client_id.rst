@@ -1,16 +1,5 @@
 .. _param-omazuredce-client_id:
-<<<<<<< HEAD
-<<<<<<< HEAD
 .. _omazuredce.parameter.action.client_id:
-=======
-.. _omazuredce.parameter.input.client_id:
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-.. _omazuredce.parameter.input.client_id:
-=======
-.. _omazuredce.parameter.action.client_id:
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 .. meta::
    :description: Reference for the omazuredce client_id parameter.
@@ -33,18 +22,7 @@ requests.
 This parameter applies to :doc:`../../configuration/modules/omazuredce`.
 
 :Name: client_id
-<<<<<<< HEAD
-<<<<<<< HEAD
 :Scope: action
-=======
-:Scope: input
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-:Scope: input
-=======
-:Scope: action
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 :Type: string
 :Default: none
 :Required?: yes
@@ -56,26 +34,9 @@ Description
 the Logs Ingestion API. It is used together with ``client_secret`` and
 ``tenant_id``.
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 Action usage
 ------------
 .. _omazuredce.parameter.action.client_id-usage:
-=======
-Input usage
------------
-.. _omazuredce.parameter.input.client_id-usage:
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-Input usage
------------
-.. _omazuredce.parameter.input.client_id-usage:
-=======
-Action usage
-------------
-.. _omazuredce.parameter.action.client_id-usage:
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 .. code-block:: rsyslog
 

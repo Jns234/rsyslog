@@ -2904,8 +2904,6 @@ AC_ARG_ENABLE(omazuredce,
          esac],
         [enable_omazuredce=no]
 )
-<<<<<<< HEAD
-<<<<<<< HEAD
 if test "x$enable_omazuredce" = "xyes" -o "x$enable_omazuredce" = "xoptional"; then
 	PKG_CHECK_MODULES([CURL], [libcurl], , [
 		AS_IF([test x$enable_omazuredce = xyes],
@@ -2915,23 +2913,6 @@ if test "x$enable_omazuredce" = "xyes" -o "x$enable_omazuredce" = "xoptional"; t
 	])
 fi
 AM_CONDITIONAL(ENABLE_OMAZUREDCE, test x$enable_omazuredce = xyes -o x$enable_omazuredce = xoptional)
-=======
-AM_CONDITIONAL(ENABLE_OMAZUREDCE, test x$enable_omazuredce = xyes)
->>>>>>> d611f7117 (Add azure Monitor API ingestion module)
-=======
-AM_CONDITIONAL(ENABLE_OMAZUREDCE, test x$enable_omazuredce = xyes)
-=======
-if test "x$enable_omazuredce" = "xyes" -o "x$enable_omazuredce" = "xoptional"; then
-	PKG_CHECK_MODULES([CURL], [libcurl], , [
-		AS_IF([test x$enable_omazuredce = xyes],
-			AC_MSG_FAILURE([omazuredce requires libcurl])
-		)
-		enable_omazuredce="no"
-	])
-fi
-AM_CONDITIONAL(ENABLE_OMAZUREDCE, test x$enable_omazuredce = xyes -o x$enable_omazuredce = xoptional)
->>>>>>> 5508f1427 (Add azure Monitor API ingestion module)
->>>>>>> d938bc052 (Add azure Monitor API ingestion module)
 
 # omazureeventhubs support for output module
 AC_ARG_ENABLE(omazureeventhubs,
